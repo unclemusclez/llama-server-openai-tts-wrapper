@@ -264,16 +264,38 @@ async def generate_speech(request: Request):
                         dec_json = await resp.json()
                         logger.debug(f"Decoder response: {dec_json}")
                         if isinstance(dec_json, list):
-                            embd = [
-                                (
-                                    item["embedding"]
-                                    if isinstance(item, dict) and "embedding" in item
-                                    else item
-                                )
-                                for item in dec_json
-                            ]
+                            embd = []
+                            for item in dec_json:
+                                if isinstance(item, dict):
+                                    if "embedding" in item:
+                                        embd.append(item["embedding"])
+                                    else:
+                                        logger.error(
+                                            f"Dictionary item missing 'embedding' key: {item}"
+                                        )
+                                        raise HTTPException(
+                                            status_code=500,
+                                            detail=f"Invalid embedding item: {item}",
+                                        )
+                                elif isinstance(item, list) and all(
+                                    isinstance(v, (int, float)) for v in item
+                                ):
+                                    embd.append(item)
+                                else:
+                                    logger.error(f"Unexpected item format: {item}")
+                                    raise HTTPException(
+                                        status_code=500,
+                                        detail=f"Unexpected item format: {item}",
+                                    )
                         elif isinstance(dec_json, dict):
                             embd = dec_json.get("embedding")
+                            if not isinstance(embd, list):
+                                logger.error(
+                                    f"Embedding from dict is not a list: {embd}"
+                                )
+                                raise HTTPException(
+                                    status_code=500, detail="Invalid embedding format"
+                                )
                         else:
                             logger.error(
                                 f"Unexpected decoder response format: {dec_json}"
