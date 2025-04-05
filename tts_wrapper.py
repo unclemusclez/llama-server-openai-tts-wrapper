@@ -241,28 +241,27 @@ async def generate_speech(request: Request):
                         f"Generated codes: {len(codes)}, codes: {codes[:10]}..."
                     )
 
-                for i in range(0, len(codes), batchSize):
-                    batch = codes[i : i + batchSize]
-                    logger.debug(
-                        f"Processing batch {i//batchSize + 1}: {len(batch)} codes: {batch[:10]}..."
-                    )
-                    start_time = time.time()
-                    async with session.post(
-                        TTSW_AUDIO_DECODER_ENDPOINT,
-                        json={"input": batch},
-                        headers={
-                            "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
-                        },
-                        ssl=(
-                            False
-                            if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
-                            else ssl_context
-                        ),
-                        timeout=aiohttp.ClientTimeout(total=60),
-                    ) as resp:
-                        resp.raise_for_status()
-                        dec_json = await resp.json()
-                        logger.debug(f"Decoder response: {dec_json}")
+                    for i in range(0, len(codes), batchSize):
+                        batch = codes[i : i + batchSize]
+                        logger.debug(f"Sending batch {i//batchSize + 1}: {batch}")
+                        async with session.post(
+                            TTSW_AUDIO_DECODER_ENDPOINT,
+                            json={"input": batch},
+                            headers={
+                                "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
+                            },
+                            ssl=(
+                                False
+                                if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
+                                else ssl_context
+                            ),
+                            timeout=aiohttp.ClientTimeout(total=60),
+                        ) as resp:
+                            resp.raise_for_status()
+                            dec_json = await resp.json()
+                            logger.debug(
+                                f"Decoder response for batch {i//batchSize + 1}: {dec_json}"
+                            )
 
                         # Determine embedding format
                         if isinstance(dec_json, list):
