@@ -263,47 +263,37 @@ async def generate_speech(request: Request):
                         resp.raise_for_status()
                         dec_json = await resp.json()
                         logger.debug(f"Decoder response: {dec_json}")
+
+                        # Determine embedding format
                         if isinstance(dec_json, list):
                             embd = []
                             for item in dec_json:
-                                if isinstance(item, dict):
-                                    if "embedding" in item:
-                                        embd.append(item["embedding"])
-                                    else:
-                                        logger.error(
-                                            f"Dictionary item missing 'embedding' key: {item}"
-                                        )
-                                        raise HTTPException(
-                                            status_code=500,
-                                            detail=f"Invalid embedding item: {item}",
-                                        )
+                                if isinstance(item, dict) and "embedding" in item:
+                                    embd.append(item["embedding"])
                                 elif isinstance(item, list) and all(
                                     isinstance(v, (int, float)) for v in item
                                 ):
                                     embd.append(item)
                                 else:
-                                    logger.error(f"Unexpected item format: {item}")
+                                    logger.error(
+                                        f"Unexpected item in decoder response: {item}"
+                                    )
                                     raise HTTPException(
                                         status_code=500,
-                                        detail=f"Unexpected item format: {item}",
+                                        detail=f"Unexpected item format in decoder response: {item}",
                                     )
-                        elif isinstance(dec_json, dict):
-                            embd = dec_json.get("embedding")
-                            if not isinstance(embd, list):
-                                logger.error(
-                                    f"Embedding from dict is not a list: {embd}"
-                                )
-                                raise HTTPException(
-                                    status_code=500, detail="Invalid embedding format"
-                                )
+                        elif isinstance(dec_json, dict) and "embedding" in dec_json:
+                            embd = dec_json["embedding"]
                         else:
                             logger.error(
                                 f"Unexpected decoder response format: {dec_json}"
                             )
                             raise HTTPException(
                                 status_code=500,
-                                detail="Unexpected decoder response format",
+                                detail=f"Unexpected decoder response format: {dec_json}",
                             )
+
+                        # Validate embeddings
                         if (
                             not embd
                             or not isinstance(embd, list)
@@ -315,8 +305,10 @@ async def generate_speech(request: Request):
                         ):
                             logger.error(f"Invalid embedding format: {embd}")
                             raise HTTPException(
-                                status_code=500, detail="Invalid embedding format"
+                                status_code=500,
+                                detail=f"Invalid embedding format: {embd}",
                             )
+
                         audio = embd_to_audio(embd, len(embd), len(embd[0]))
                         audio_data = np.clip(audio * 32767, -32768, 32767).astype(
                             np.int16
