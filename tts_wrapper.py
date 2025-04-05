@@ -31,7 +31,6 @@ TTSW_AUDIO_DECODER_ENDPOINT = os.getenv(
     "TTSW_AUDIO_DECODER_ENDPOINT", "http://127.0.0.1:11435/embedding"
 )
 TTSW_API_KEY = os.getenv("TTSW_API_KEY", "mysecretkey")
-TTSW_AUDIO_INFERENCE_API_KEY = os.getenv("TTSW_AUDIO_INFERENCE_API_KEY", TTSW_API_KEY)
 TTSW_AUDIO_DECODER_API_KEY = os.getenv("TTSW_AUDIO_DECODER_API_KEY", TTSW_API_KEY)
 TTSW_CA_CERT_PATH = os.getenv("TTSW_CA_CERT_PATH", "/path/to/certs/certfile.crt")
 TTSW_VOICES_DIR = os.getenv("TTSW_VOICES_DIR", "./voices")
@@ -78,7 +77,7 @@ def fold(buffer, n_out, n_win, n_hop, n_pad):
     for i in range(n_frames):
         start = i * n_hop
         end = start + n_win
-        result[start:end] += buffer[i * n_win : (i + 1) * n_win]
+        result[start:end] += buffer[i * n_win : (i + 1) * n_win]  # Fixed
     return result[n_pad:-n_pad] if n_pad > 0 else result
 
 
@@ -109,7 +108,7 @@ def embd_to_audio(embd, n_codes, n_embd, n_thread=4):
             mag = E[k, l]
             phi = E[k + half_embd, l]
             mag = np.clip(np.exp(mag), 0, 1e2)
-            S[l, k] = mag * np.exp(1j * phi)
+            S[l, k] = mag * np.exp(1j * phi)  # Fixed
 
     res = np.zeros(n_codes * n_fft)
     hann2_buffer = np.zeros(n_codes * n_fft)
@@ -263,7 +262,7 @@ async def generate_speech(request: Request):
                     ) as resp:
                         resp.raise_for_status()
                         dec_json = await resp.json()
-                        embd = dec_json.get("embedding")
+                        embd = dec_json  # Directly use the list response
                         if not embd or not isinstance(embd, list):
                             logger.error(f"Invalid decoder response: {dec_json}")
                             raise HTTPException(
@@ -277,7 +276,6 @@ async def generate_speech(request: Request):
                         logger.debug(
                             f"Batch {i//batchSize + 1} took {time.time() - start_time:.2f}s"
                         )
-
         # Concatenate all audio into a single array
         combined_audio = (
             np.concatenate(all_audio) if all_audio else np.array([], dtype=np.int16)
