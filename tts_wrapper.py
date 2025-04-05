@@ -9,20 +9,54 @@ import os
 import wave
 import io
 import json
+import ssl
+from dotenv import load_dotenv
 
 app = FastAPI()
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-LLM_SERVER = "http://127.0.0.1:11434"
-DECODER_SERVER = "http://127.0.0.1:11435/embeddings"
-API_KEY = "mysecretkey"  # Replace with actual key from 11434
-CA_CERT_PATH = "/etc/ssl/certs/kamala_ca.crt"
+# Load environment variables
+load_dotenv()
 
-if not os.path.exists(CA_CERT_PATH):
+# Server config
+TTSW_HOST = os.getenv("TTSW_HOST", "127.0.0.1")
+TTSW_PORT = int(os.getenv("TTSW_PORT", "11436"))
+TTSW_AUDIO_INFERENCE_ENDPOINT = os.getenv(
+    "TTSW_AUDIO_INFERENCE_ENDPOINT", "http://127.0.0.1:11434/completion"
+)
+TTSW_AUDIO_DECODER_ENDPOINT = os.getenv(
+    "TTSW_AUDIO_DECODER_ENDPOINT", "http://127.0.0.1:11435/embeddings"
+)
+TTSW_API_KEY = os.getenv("TTSW_API_KEY", "mysecretkey")  # Fallback unified key
+TTSW_AUDIO_INFERENCE_API_KEY = os.getenv("TTSW_AUDIO_INFERENCE_API_KEY", TTSW_API_KEY)
+TTSW_AUDIO_DECODER_API_KEY = os.getenv("TTSW_AUDIO_DECODER_API_KEY", TTSW_API_KEY)
+TTSW_CA_CERT_PATH = os.getenv("TTSW_CA_CERT_PATH", "/path/to/certs/certfile.crt")
+TTSW_VOICES_DIR = os.getenv("TTSW_VOICES_DIR", "./voices")
+TTSW_DISABLE_VERIFY_SSL = (
+    os.getenv("TTSW_DISABLE_VERIFY_SSL", "false").lower() == "true"
+)
+
+# Inference params
+nPredict = int(os.getenv("TTSW_N_PREDICT", "1024"))
+topK = int(os.getenv("TTSW_TOP_K", "10"))
+temperature = float(os.getenv("TTSW_TEMPERATURE", "0.1"))
+topP = float(os.getenv("TTSW_TOP_P", "0.1"))
+seed = int(os.getenv("TTSW_SEED", "69"))
+nFft = int(os.getenv("TTSW_N_FFT", "1280"))
+nHop = int(os.getenv("TTSW_N_HOP", "320"))
+nWin = int(os.getenv("TTSW_N_WIN", "1280"))
+batchSize = int(os.getenv("TTSW_BATCH_SIZE", "256"))
+
+if not os.path.exists(TTSW_CA_CERT_PATH):
     logger.warning(
-        f"CA certificate not found at {CA_CERT_PATH}. Using system CA bundle."
+        f"CA certificate not found at {TTSW_CA_CERT_PATH}. Using default SSL."
     )
+
+# SSLContext setup
+ssl_context = None
+if os.path.exists(TTSW_CA_CERT_PATH) and not TTSW_DISABLE_VERIFY_SSL:
+    ssl_context = ssl.create_default_context(cafile=TTSW_CA_CERT_PATH)
 
 
 # Helper functions (unchanged from your last version)
@@ -56,9 +90,9 @@ def process_frame(args):
 
 def embd_to_audio(embd, n_codes, n_embd, n_thread=4):
     embd = np.asarray(embd, dtype=np.float32).reshape(n_codes, n_embd)
-    n_fft = 1280
-    n_hop = 320
-    n_win = 1280
+    n_fft = nFft
+    n_hop = nHop
+    n_win = nWin
     n_pad = (n_win - n_hop) // 2
     n_out = (n_codes - 1) * n_hop + n_win
     hann = fill_hann_window(n_fft, True)
@@ -106,7 +140,7 @@ async def generate_speech(request: Request):
     try:
         payload = await request.json()
         text = payload.get("input", "")
-        voice_file = payload.get("voice", None)  # Optional speaker file path
+        voice_file = payload.get("voice", None)
         if not text:
             logger.error("No input provided")
             raise HTTPException(status_code=400, detail="Missing 'input' in payload")
@@ -122,7 +156,12 @@ async def generate_speech(request: Request):
         audio_data = ""
         if voice_file:
             try:
-                with open(voice_file, "r") as f:
+                voice_path = (
+                    voice_file
+                    if os.path.isabs(voice_file)
+                    else os.path.join(TTSW_VOICES_DIR, voice_file)
+                )
+                with open(voice_path, "r") as f:
                     speaker = json.load(f)
                 audio_text = (
                     "<|text_start|>"
@@ -149,22 +188,26 @@ async def generate_speech(request: Request):
         # LLM request with aiohttp
         logger.debug("Calling LLM server")
         async with aiohttp.ClientSession() as session:
-            timeout = aiohttp.ClientTimeout(total=60)  # 60-second total timeout
+            timeout = aiohttp.ClientTimeout(total=60)
             async with session.post(
-                f"{LLM_SERVER}/completion",
+                TTSW_AUDIO_INFERENCE_ENDPOINT,
                 json={
                     "prompt": prompt,
-                    "n_predict": 1024,
+                    "n_predict": nPredict,
                     "cache_prompt": True,
                     "return_tokens": True,
                     "samplers": ["top_k"],
-                    "top_k": 16,
-                    "temperature": 1.0,
-                    "top_p": 0.9,
-                    "seed": 1003,
+                    "top_k": topK,
+                    "temperature": temperature,
+                    "top_p": topP,
+                    "seed": seed,
                 },
-                headers={"Authorization": f"Bearer {API_KEY}"},
-                ssl=CA_CERT_PATH if os.path.exists(CA_CERT_PATH) else True,
+                headers={"Authorization": f"Bearer {TTSW_AUDIO_INFERENCE_API_KEY}"},
+                ssl=(
+                    False
+                    if TTSW_AUDIO_INFERENCE_ENDPOINT.startswith("http://")
+                    else ssl_context
+                ),
                 timeout=timeout,
             ) as resp:
                 resp.raise_for_status()
@@ -180,19 +223,22 @@ async def generate_speech(request: Request):
                 logger.debug(f"Generated codes: {len(codes)}, codes: {codes[:10]}...")
 
         # Batch processing with aiohttp
-        batch_size = 256
         all_audio = []
         async with aiohttp.ClientSession() as session:
-            for i in range(0, len(codes), batch_size):
-                batch = codes[i : i + batch_size]
+            for i in range(0, len(codes), batchSize):
+                batch = codes[i : i + batchSize]
                 logger.debug(
-                    f"Processing batch {i//batch_size + 1}: {len(batch)} codes: {batch[:10]}..."
+                    f"Processing batch {i//batchSize + 1}: {len(batch)} codes: {batch[:10]}..."
                 )
                 async with session.post(
-                    DECODER_SERVER,
+                    TTSW_AUDIO_DECODER_ENDPOINT,
                     json={"input": batch},
-                    headers={"Authorization": f"Bearer {API_KEY}"},
-                    ssl=CA_CERT_PATH if os.path.exists(CA_CERT_PATH) else True,
+                    headers={"Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"},
+                    ssl=(
+                        False
+                        if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
+                        else ssl_context
+                    ),
                     timeout=aiohttp.ClientTimeout(total=60),
                 ) as resp:
                     resp.raise_for_status()
@@ -248,4 +294,4 @@ async def generate_speech(request: Request):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=11436, log_level="debug")
+    uvicorn.run(app, host=TTSW_HOST, port=TTSW_PORT, log_level="debug")
