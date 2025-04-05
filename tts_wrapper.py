@@ -229,6 +229,7 @@ async def generate_speech(request: Request):
                 ) as resp:
                     resp.raise_for_status()
                     llm_json = await resp.json()
+                    logger.debug(f"LLM response: {llm_json}")  # Add this
                     if "tokens" not in llm_json:
                         logger.error(f"LLM response missing 'tokens': {llm_json}")
                         raise HTTPException(
@@ -301,10 +302,10 @@ async def generate_speech(request: Request):
         )
 
     except aiohttp.ClientError as e:
-        logger.error(f"Request failed: {e}")
+        logger.error(f"Request failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"TTS server error: {str(e)}")
     except Exception as e:
-        logger.error(f"Processing failed: {e}")
+        logger.error(f"Processing failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal TTS error: {str(e)}")
 
 
