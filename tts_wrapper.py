@@ -167,7 +167,8 @@ async def generate_speech(request: Request):
         segments = process_text(text, segmentation)
 
         # ... (voice file loading)
-
+        audio_text = ""
+        audio_data = ""
         all_audio = []
         async with aiohttp.ClientSession() as session:
             for segment in segments:
