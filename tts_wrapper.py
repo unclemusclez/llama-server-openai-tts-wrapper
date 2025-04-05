@@ -10,7 +10,7 @@ import numpy as np
 import time
 from pydantic import BaseModel
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
 
@@ -194,103 +194,112 @@ async def generate_speech(request: Request):
                     status_code=500, detail=f"Voice file error: {str(e)}"
                 )
 
-        async def audio_stream():
-            async with aiohttp.ClientSession() as session:
-                for segment in segments:
-                    prompt_base = (
-                        "<|im_start|>\n<|text_start|>"
-                        + " ".join(segment)
-                        + "<|audio_start|>\n"
-                    )
-                    prompt = audio_text + prompt_base + audio_data
+        all_audio = []
+        async with aiohttp.ClientSession() as session:
+            for segment in segments:
+                prompt_base = (
+                    "<|im_start|>\n<|text_start|>"
+                    + " ".join(segment)
+                    + "<|audio_start|>\n"
+                )
+                prompt = audio_text + prompt_base + audio_data
 
-                    # LLM request
-                    logger.debug("Calling LLM server")
+                # LLM request
+                logger.debug("Calling LLM server")
+                async with session.post(
+                    TTSW_AUDIO_INFERENCE_ENDPOINT,
+                    json={
+                        "prompt": prompt,
+                        "n_predict": nPredict,
+                        "cache_prompt": True,
+                        "return_tokens": True,
+                        "samplers": ["top_k"],
+                        "top_k": topK,
+                        "temperature": temperature,
+                        "top_p": topP,
+                        "seed": seed,
+                    },
+                    headers={"Authorization": f"Bearer {TTSW_AUDIO_INFERENCE_API_KEY}"},
+                    ssl=(
+                        False
+                        if TTSW_AUDIO_INFERENCE_ENDPOINT.startswith("http://")
+                        else ssl_context
+                    ),
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as resp:
+                    resp.raise_for_status()
+                    llm_json = await resp.json()
+                    if "tokens" not in llm_json:
+                        logger.error(f"LLM response missing 'tokens': {llm_json}")
+                        raise HTTPException(
+                            status_code=500, detail="LLM server did not return tokens"
+                        )
+                    codes = [
+                        t - 151672 for t in llm_json["tokens"] if 151672 <= t <= 155772
+                    ]
+                    logger.debug(
+                        f"Generated codes: {len(codes)}, codes: {codes[:10]}..."
+                    )
+
+                # Batch processing with timing
+                for i in range(0, len(codes), batchSize):
+                    batch = codes[i : i + batchSize]
+                    logger.debug(
+                        f"Processing batch {i//batchSize + 1}: {len(batch)} codes: {batch[:10]}..."
+                    )
+                    start_time = time.time()
                     async with session.post(
-                        TTSW_AUDIO_INFERENCE_ENDPOINT,
-                        json={
-                            "prompt": prompt,
-                            "n_predict": nPredict,
-                            "cache_prompt": True,
-                            "return_tokens": True,
-                            "samplers": ["top_k"],
-                            "top_k": topK,
-                            "temperature": temperature,
-                            "top_p": topP,
-                            "seed": seed,
-                        },
+                        TTSW_AUDIO_DECODER_ENDPOINT,
+                        json={"input": batch},
                         headers={
-                            "Authorization": f"Bearer {TTSW_AUDIO_INFERENCE_API_KEY}"
+                            "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
                         },
                         ssl=(
                             False
-                            if TTSW_AUDIO_INFERENCE_ENDPOINT.startswith("http://")
+                            if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
                             else ssl_context
                         ),
                         timeout=aiohttp.ClientTimeout(total=60),
                     ) as resp:
                         resp.raise_for_status()
-                        llm_json = await resp.json()
-                        if "tokens" not in llm_json:
-                            logger.error(f"LLM response missing 'tokens': {llm_json}")
+                        dec_json = await resp.json()
+                        embd = dec_json.get("embedding")
+                        if not embd or not isinstance(embd, list):
+                            logger.error(f"Invalid decoder response: {dec_json}")
                             raise HTTPException(
-                                status_code=500,
-                                detail="LLM server did not return tokens",
+                                status_code=500, detail="Invalid decoder response"
                             )
-                        codes = [
-                            t - 151672
-                            for t in llm_json["tokens"]
-                            if 151672 <= t <= 155772
-                        ]
+                        audio = embd_to_audio(embd, len(embd), len(embd[0]))
+                        audio_data = np.clip(audio * 32767, -32768, 32767).astype(
+                            np.int16
+                        )
+                        all_audio.append(audio_data)
                         logger.debug(
-                            f"Generated codes: {len(codes)}, codes: {codes[:10]}..."
+                            f"Batch {i//batchSize + 1} took {time.time() - start_time:.2f}s"
                         )
 
-                    # Batch processing with timing
-                    for i in range(0, len(codes), batchSize):
-                        batch = codes[i : i + batchSize]
-                        logger.debug(
-                            f"Processing batch {i//batchSize + 1}: {len(batch)} codes: {batch[:10]}..."
-                        )
-                        start_time = time.time()
-                        async with session.post(
-                            TTSW_AUDIO_DECODER_ENDPOINT,
-                            json={"input": batch},
-                            headers={
-                                "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
-                            },
-                            ssl=(
-                                False
-                                if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
-                                else ssl_context
-                            ),
-                            timeout=aiohttp.ClientTimeout(total=60),
-                        ) as resp:
-                            resp.raise_for_status()
-                            dec_json = await resp.json()
-                            embd = dec_json.get("embedding")
-                            if not embd or not isinstance(embd, list):
-                                logger.error(f"Invalid decoder response: {dec_json}")
-                                raise HTTPException(
-                                    status_code=500, detail="Invalid decoder response"
-                                )
-                            audio = embd_to_audio(embd, len(embd), len(embd[0]))
-                            audio_data = np.clip(audio * 32767, -32768, 32767).astype(
-                                np.int16
-                            )
-                            logger.debug(
-                                f"Batch {i//batchSize + 1} took {time.time() - start_time:.2f}s"
-                            )
+        # Concatenate all audio into a single array
+        combined_audio = (
+            np.concatenate(all_audio) if all_audio else np.array([], dtype=np.int16)
+        )
+        logger.debug(f"Total audio samples: {len(combined_audio)}")
 
-                            wav_io = io.BytesIO()
-                            with wave.open(wav_io, "wb") as wav_file:
-                                wav_file.setnchannels(1)
-                                wav_file.setsampwidth(2)
-                                wav_file.setframerate(24000)
-                                wav_file.writeframes(audio_data.tobytes())
-                            yield wav_io.getvalue()
+        # Write to WAV
+        wav_io = io.BytesIO()
+        with wave.open(wav_io, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(24000)
+            wav_file.setnframes(len(combined_audio))
+            wav_file.writeframes(combined_audio.tobytes())
 
-        return StreamingResponse(audio_stream(), media_type="audio/wav")
+        wav_data = wav_io.getvalue()
+        logger.debug(f"Generated WAV: {len(wav_data)} bytes")
+        return Response(
+            content=wav_data,
+            media_type="audio/wav",
+            headers={"Content-Length": str(len(wav_data))},
+        )
 
     except aiohttp.ClientError as e:
         logger.error(f"Request failed: {e}")
