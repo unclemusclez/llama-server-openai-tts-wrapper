@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import Response
-import requests
+import aiohttp
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 import re
@@ -8,6 +8,7 @@ import logging
 import os
 import wave
 import io
+import json
 
 app = FastAPI()
 logging.basicConfig(level=logging.DEBUG)
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 LLM_SERVER = "http://127.0.0.1:11434"
 DECODER_SERVER = "http://127.0.0.1:11435/embeddings"
-API_KEY = "mysecretkey"  # Replace with your actual key
+API_KEY = "mysecretkey"  # Replace with actual key from 11434
 CA_CERT_PATH = "/etc/ssl/certs/kamala_ca.crt"
 
 if not os.path.exists(CA_CERT_PATH):
@@ -24,7 +25,7 @@ if not os.path.exists(CA_CERT_PATH):
     )
 
 
-# Helper functions
+# Helper functions (unchanged from your last version)
 def fill_hann_window(size, periodic=True):
     if periodic:
         return np.hanning(size + 1)[:-1]
@@ -105,7 +106,7 @@ async def generate_speech(request: Request):
     try:
         payload = await request.json()
         text = payload.get("input", "")
-        voice_file = payload.get("voice", None)  # e.g., "/path/to/corrosion.json"
+        voice_file = payload.get("voice", None)  # Optional speaker file path
         if not text:
             logger.error("No input provided")
             raise HTTPException(status_code=400, detail="Missing 'input' in payload")
@@ -116,7 +117,7 @@ async def generate_speech(request: Request):
             "<|im_start|>\n<|text_start|>" + " ".join(words) + "<|audio_start|>\n"
         )
 
-        # Load speaker profile if voice is provided
+        # Load speaker profile if provided
         audio_text = ""
         audio_data = ""
         if voice_file:
@@ -145,71 +146,77 @@ async def generate_speech(request: Request):
 
         prompt = audio_text + prompt_base + audio_data
 
-        # LLM request
+        # LLM request with aiohttp
         logger.debug("Calling LLM server")
-        llm_response = requests.post(
-            f"{LLM_SERVER}/completion",
-            json={
-                "prompt": prompt,
-                "n_predict": 1024,
-                "cache_prompt": True,
-                "return_tokens": True,
-                "samplers": ["top_k"],
-                "top_k": 16,
-                "temperature": 1.0,
-                "top_p": 0.9,
-                "seed": 1003,
-            },
-            headers={"Authorization": f"Bearer {API_KEY}"},
-            verify=CA_CERT_PATH if os.path.exists(CA_CERT_PATH) else True,
-            timeout=30,
-        )
-        llm_response.raise_for_status()
-        llm_json = llm_response.json()
-        if "tokens" not in llm_json:
-            logger.error(f"LLM response missing 'tokens': {llm_json}")
-            raise HTTPException(
-                status_code=500, detail="LLM server did not return tokens"
-            )
-        codes = [t - 151672 for t in llm_json["tokens"] if 151672 <= t <= 155772]
-        logger.debug(f"Generated codes: {len(codes)}, codes: {codes[:10]}...")
+        async with aiohttp.ClientSession() as session:
+            timeout = aiohttp.ClientTimeout(total=60)  # 60-second total timeout
+            async with session.post(
+                f"{LLM_SERVER}/completion",
+                json={
+                    "prompt": prompt,
+                    "n_predict": 1024,
+                    "cache_prompt": True,
+                    "return_tokens": True,
+                    "samplers": ["top_k"],
+                    "top_k": 16,
+                    "temperature": 1.0,
+                    "top_p": 0.9,
+                    "seed": 1003,
+                },
+                headers={"Authorization": f"Bearer {API_KEY}"},
+                ssl=CA_CERT_PATH if os.path.exists(CA_CERT_PATH) else True,
+                timeout=timeout,
+            ) as resp:
+                resp.raise_for_status()
+                llm_json = await resp.json()
+                if "tokens" not in llm_json:
+                    logger.error(f"LLM response missing 'tokens': {llm_json}")
+                    raise HTTPException(
+                        status_code=500, detail="LLM server did not return tokens"
+                    )
+                codes = [
+                    t - 151672 for t in llm_json["tokens"] if 151672 <= t <= 155772
+                ]
+                logger.debug(f"Generated codes: {len(codes)}, codes: {codes[:10]}...")
 
-        # Batch processing
+        # Batch processing with aiohttp
         batch_size = 256
         all_audio = []
-        for i in range(0, len(codes), batch_size):
-            batch = codes[i : i + batch_size]
-            logger.debug(
-                f"Processing batch {i//batch_size + 1}: {len(batch)} codes: {batch[:10]}..."
-            )
-            dec_response = requests.post(
-                DECODER_SERVER,
-                json={"input": batch},
-                headers={"Authorization": f"Bearer {API_KEY}"},
-                verify=CA_CERT_PATH if os.path.exists(CA_CERT_PATH) else True,
-                timeout=30,
-            )
-            dec_response.raise_for_status()
-            dec_json = dec_response.json()
-            logger.debug(f"Decoder response: {dec_json[:100]}...")
-
-            if (
-                isinstance(dec_json, list)
-                and len(dec_json) > 0
-                and "embedding" in dec_json[0]
-            ):
-                embd = dec_json[0]["embedding"]
-            elif isinstance(dec_json, dict) and "embedding" in dec_json:
-                embd = dec_json["embedding"]
-            else:
-                logger.error(f"Invalid decoder response: {dec_json}")
-                raise HTTPException(
-                    status_code=500, detail=f"Invalid decoder response: {dec_json}"
+        async with aiohttp.ClientSession() as session:
+            for i in range(0, len(codes), batch_size):
+                batch = codes[i : i + batch_size]
+                logger.debug(
+                    f"Processing batch {i//batch_size + 1}: {len(batch)} codes: {batch[:10]}..."
                 )
+                async with session.post(
+                    DECODER_SERVER,
+                    json={"input": batch},
+                    headers={"Authorization": f"Bearer {API_KEY}"},
+                    ssl=CA_CERT_PATH if os.path.exists(CA_CERT_PATH) else True,
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as resp:
+                    resp.raise_for_status()
+                    dec_json = await resp.json()
+                    logger.debug(f"Decoder response: {dec_json[:100]}...")
 
-            audio = embd_to_audio(embd, len(embd), len(embd[0]))
-            audio_data = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
-            all_audio.append(audio_data)
+                    if (
+                        isinstance(dec_json, list)
+                        and len(dec_json) > 0
+                        and "embedding" in dec_json[0]
+                    ):
+                        embd = dec_json[0]["embedding"]
+                    elif isinstance(dec_json, dict) and "embedding" in dec_json:
+                        embd = dec_json["embedding"]
+                    else:
+                        logger.error(f"Invalid decoder response: {dec_json}")
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"Invalid decoder response: {dec_json}",
+                        )
+
+                    audio = embd_to_audio(embd, len(embd), len(embd[0]))
+                    audio_data = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+                    all_audio.append(audio_data)
 
         combined_audio = np.concatenate(all_audio)
         logger.debug(f"Total audio samples: {len(combined_audio)}")
@@ -230,7 +237,7 @@ async def generate_speech(request: Request):
             headers={"Content-Length": str(len(wav_data))},
         )
 
-    except requests.RequestException as e:
+    except aiohttp.ClientError as e:
         logger.error(f"Request failed: {e}")
         raise HTTPException(status_code=500, detail=f"TTS server error: {str(e)}")
     except Exception as e:
