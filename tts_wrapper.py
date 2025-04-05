@@ -26,7 +26,7 @@ TTSW_AUDIO_INFERENCE_ENDPOINT = os.getenv(
     "TTSW_AUDIO_INFERENCE_ENDPOINT", "http://127.0.0.1:11434/completion"
 )
 TTSW_AUDIO_DECODER_ENDPOINT = os.getenv(
-    "TTSW_AUDIO_DECODER_ENDPOINT", "http://127.0.0.1:11435/embeddings"
+    "TTSW_AUDIO_DECODER_ENDPOINT", "http://127.0.0.1:11435/embedding"
 )
 TTSW_API_KEY = os.getenv("TTSW_API_KEY", "mysecretkey")  # Fallback unified key
 TTSW_AUDIO_INFERENCE_API_KEY = os.getenv("TTSW_AUDIO_INFERENCE_API_KEY", TTSW_API_KEY)
