@@ -40,7 +40,8 @@ TTSW_DISABLE_VERIFY_SSL = (
 )
 
 # Inference params
-nPredict = int(os.getenv("TTSW_N_PREDICT", "1024"))
+nPredict = int(os.getenv("TTSW_N_PREDICT", "1024"))  # Default, overridden by request
+batchSize = int(os.getenv("TTSW_BATCH_SIZE", "64"))  # Reduced default
 topK = int(os.getenv("TTSW_TOP_K", "10"))
 temperature = float(os.getenv("TTSW_TEMPERATURE", "0.1"))
 topP = float(os.getenv("TTSW_TOP_P", "0.1"))
@@ -48,7 +49,6 @@ seed = int(os.getenv("TTSW_SEED", "69"))
 nFft = int(os.getenv("TTSW_N_FFT", "1280"))
 nHop = int(os.getenv("TTSW_N_HOP", "320"))
 nWin = int(os.getenv("TTSW_N_WIN", "1280"))
-batchSize = int(os.getenv("TTSW_BATCH_SIZE", "256"))
 
 if not os.path.exists(TTSW_CA_CERT_PATH):
     logger.warning(
@@ -146,6 +146,7 @@ class SpeechRequest(BaseModel):
     input: str
     voice: str | None = None
     segmentation: str | None = "none"
+    n_predict: int | None = None
 
 
 @app.post("/audio/speech")
@@ -154,45 +155,18 @@ async def generate_speech(request: Request):
         payload = await request.json()
         req = SpeechRequest(**payload)
         text, voice_file, segmentation = req.input, req.voice, req.segmentation
+        n_predict = req.n_predict if req.n_predict is not None else nPredict
+        n_predict = min(n_predict, 2048)  # Cap at 2048
         if not text:
             logger.error("No input provided")
             raise HTTPException(status_code=400, detail="Missing 'input' in payload")
 
-        logger.debug(f"Processing text: {text} with segmentation: {segmentation}")
+        logger.info(
+            f"Processing text: {text} with segmentation: {segmentation}, n_predict: {n_predict}"
+        )
         segments = process_text(text, segmentation)
 
-        # Load speaker profile if provided
-        audio_text, audio_data = "", ""
-        if voice_file:
-            try:
-                voice_path = (
-                    voice_file
-                    if os.path.isabs(voice_file)
-                    else os.path.join(TTSW_VOICES_DIR, voice_file)
-                )
-                with open(voice_path, "r") as f:
-                    speaker = json.load(f)
-                audio_text = (
-                    "<|text_start|>"
-                    + " ".join(word["word"] for word in speaker["words"])
-                    + " "
-                )
-                audio_data = "<|audio_start|>\n"
-                for word in speaker["words"]:
-                    word_text, duration, codes = (
-                        word["word"],
-                        word["duration"],
-                        word["codes"],
-                    )
-                    audio_data += f"{word_text}<|t_{duration:.2f}>"
-                    for code in codes:
-                        audio_data += f"<|{code}|>"
-                    audio_data += "\n"
-            except Exception as e:
-                logger.error(f"Failed to load voice file: {e}")
-                raise HTTPException(
-                    status_code=500, detail=f"Voice file error: {str(e)}"
-                )
+        # ... (voice file loading)
 
         all_audio = []
         async with aiohttp.ClientSession() as session:
@@ -204,12 +178,11 @@ async def generate_speech(request: Request):
                 )
                 prompt = audio_text + prompt_base + audio_data
 
-                logger.debug("Calling LLM server")
                 async with session.post(
                     TTSW_AUDIO_INFERENCE_ENDPOINT,
                     json={
                         "prompt": prompt,
-                        "n_predict": nPredict,
+                        "n_predict": n_predict,
                         "cache_prompt": True,
                         "return_tokens": True,
                         "samplers": ["top_k"],
@@ -228,7 +201,6 @@ async def generate_speech(request: Request):
                 ) as resp:
                     resp.raise_for_status()
                     llm_json = await resp.json()
-                    logger.debug(f"LLM response: {llm_json}")
                     if "tokens" not in llm_json:
                         logger.error(f"LLM response missing 'tokens': {llm_json}")
                         raise HTTPException(
@@ -237,66 +209,46 @@ async def generate_speech(request: Request):
                     codes = [
                         t - 151672 for t in llm_json["tokens"] if 151672 <= t <= 155772
                     ]
-                    # logger.debug(
-                    #     f"Generated codes: {len(codes)}, codes: {codes[:10]}..."
-                    # )
 
-                for i in range(0, len(codes), batchSize):
-                    batch = codes[i : i + batchSize]
-                    # logger.info(
-                    #     f"Processing batch {i//batchSize + 1}: {len(batch)} codes"
-                    # )
-                    async with session.post(
-                        TTSW_AUDIO_DECODER_ENDPOINT,
-                        json={"input": batch},
-                        headers={
-                            "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
-                        },
-                        ssl=(
-                            False
-                            if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
-                            else ssl_context
-                        ),
-                        timeout=aiohttp.ClientTimeout(total=60),
-                    ) as resp:
-                        resp.raise_for_status()
-                        dec_json = await resp.json()
+                    for i in range(0, len(codes), batchSize):
+                        batch = codes[i : i + batchSize]
                         logger.info(
-                            f"Decoder response received for batch {i//batchSize + 1}"
+                            f"Processing batch {i//batchSize + 1}: {len(batch)} codes"
                         )
-
-                        if isinstance(dec_json, list):
-                            embd = [
-                                item["embedding"]
-                                for item in dec_json
-                                if isinstance(item, dict) and "embedding" in item
-                            ]
-                        else:
-                            logger.error(
-                                f"Unexpected decoder response format: {dec_json}"
-                            )
-                            raise HTTPException(
-                                status_code=500,
-                                detail=f"Unexpected decoder response format: {dec_json}",
-                            )
-
-                        if not embd or not all(
-                            isinstance(e, list)
-                            and all(isinstance(v, (int, float)) for v in e)
-                            for e in embd
-                        ):
-                            logger.error(f"Invalid embedding format: {embd}")
-                            raise HTTPException(
-                                status_code=500,
-                                detail=f"Invalid embedding format: {embd}",
-                            )
-
-                        audio = embd_to_audio(embd, len(embd), len(embd[0]))
-                        audio_data = np.clip(audio * 32767, -32768, 32767).astype(
-                            np.int16
-                        )
-                        all_audio.append(audio_data)
-
+                        for attempt in range(3):
+                            try:
+                                start_time = time.time()
+                                async with session.post(
+                                    TTSW_AUDIO_DECODER_ENDPOINT,
+                                    json={"input": batch},
+                                    headers={
+                                        "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
+                                    },
+                                    ssl=(
+                                        False
+                                        if TTSW_AUDIO_DECODER_ENDPOINT.startswith(
+                                            "http://"
+                                        )
+                                        else ssl_context
+                                    ),
+                                    timeout=aiohttp.ClientTimeout(total=300),
+                                ) as resp:
+                                    resp.raise_for_status()
+                                    dec_json = await resp.json()
+                                    logger.info(
+                                        f"Decoder batch {i//batchSize + 1} took {time.time() - start_time:.2f}s"
+                                    )
+                                    break
+                            except asyncio.TimeoutError:
+                                logger.warning(
+                                    f"Timeout on attempt {attempt + 1} for batch {i//batchSize + 1}"
+                                )
+                                if attempt == 2:
+                                    raise HTTPException(
+                                        status_code=504,
+                                        detail="Decoder timed out after retries",
+                                    )
+                                await asyncio.sleep(5 * (attempt + 1))
         # Write to WAV
         wav_io = io.BytesIO()
         with wave.open(wav_io, "wb") as wav_file:
