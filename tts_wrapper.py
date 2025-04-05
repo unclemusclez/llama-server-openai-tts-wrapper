@@ -237,52 +237,40 @@ async def generate_speech(request: Request):
                     codes = [
                         t - 151672 for t in llm_json["tokens"] if 151672 <= t <= 155772
                     ]
-                    logger.debug(
-                        f"Generated codes: {len(codes)}, codes: {codes[:10]}..."
-                    )
+                    # logger.debug(
+                    #     f"Generated codes: {len(codes)}, codes: {codes[:10]}..."
+                    # )
 
-                    for i in range(0, len(codes), batchSize):
-                        batch = codes[i : i + batchSize]
-                        logger.debug(f"Sending batch {i//batchSize + 1}: {batch}")
-                        async with session.post(
-                            TTSW_AUDIO_DECODER_ENDPOINT,
-                            json={"input": batch},
-                            headers={
-                                "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
-                            },
-                            ssl=(
-                                False
-                                if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
-                                else ssl_context
-                            ),
-                            timeout=aiohttp.ClientTimeout(total=60),
-                        ) as resp:
-                            resp.raise_for_status()
-                            dec_json = await resp.json()
-                            logger.debug(
-                                f"Decoder response for batch {i//batchSize + 1}: {dec_json}"
-                            )
+                for i in range(0, len(codes), batchSize):
+                    batch = codes[i : i + batchSize]
+                    # logger.info(
+                    #     f"Processing batch {i//batchSize + 1}: {len(batch)} codes"
+                    # )
+                    async with session.post(
+                        TTSW_AUDIO_DECODER_ENDPOINT,
+                        json={"input": batch},
+                        headers={
+                            "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
+                        },
+                        ssl=(
+                            False
+                            if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
+                            else ssl_context
+                        ),
+                        timeout=aiohttp.ClientTimeout(total=60),
+                    ) as resp:
+                        resp.raise_for_status()
+                        dec_json = await resp.json()
+                        logger.info(
+                            f"Decoder response received for batch {i//batchSize + 1}"
+                        )
 
-                        # Determine embedding format
                         if isinstance(dec_json, list):
-                            embd = []
-                            for item in dec_json:
-                                if isinstance(item, dict) and "embedding" in item:
-                                    embd.append(item["embedding"])
-                                elif isinstance(item, list) and all(
-                                    isinstance(v, (int, float)) for v in item
-                                ):
-                                    embd.append(item)
-                                else:
-                                    logger.error(
-                                        f"Unexpected item in decoder response: {item}"
-                                    )
-                                    raise HTTPException(
-                                        status_code=500,
-                                        detail=f"Unexpected item format in decoder response: {item}",
-                                    )
-                        elif isinstance(dec_json, dict) and "embedding" in dec_json:
-                            embd = dec_json["embedding"]
+                            embd = [
+                                item["embedding"]
+                                for item in dec_json
+                                if isinstance(item, dict) and "embedding" in item
+                            ]
                         else:
                             logger.error(
                                 f"Unexpected decoder response format: {dec_json}"
@@ -292,15 +280,10 @@ async def generate_speech(request: Request):
                                 detail=f"Unexpected decoder response format: {dec_json}",
                             )
 
-                        # Validate embeddings
-                        if (
-                            not embd
-                            or not isinstance(embd, list)
-                            or not all(
-                                isinstance(e, list)
-                                and all(isinstance(v, (int, float)) for v in e)
-                                for e in embd
-                            )
+                        if not embd or not all(
+                            isinstance(e, list)
+                            and all(isinstance(v, (int, float)) for v in e)
+                            for e in embd
                         ):
                             logger.error(f"Invalid embedding format: {embd}")
                             raise HTTPException(
@@ -313,14 +296,6 @@ async def generate_speech(request: Request):
                             np.int16
                         )
                         all_audio.append(audio_data)
-                        logger.debug(
-                            f"Batch {i//batchSize + 1} took {time.time() - start_time:.2f}s"
-                        )
-        # Concatenate all audio into a single array
-        combined_audio = (
-            np.concatenate(all_audio) if all_audio else np.array([], dtype=np.int16)
-        )
-        logger.debug(f"Total audio samples: {len(combined_audio)}")
 
         # Write to WAV
         wav_io = io.BytesIO()
