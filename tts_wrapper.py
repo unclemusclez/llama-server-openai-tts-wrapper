@@ -204,7 +204,6 @@ async def generate_speech(request: Request):
                 )
                 prompt = audio_text + prompt_base + audio_data
 
-                # LLM request
                 logger.debug("Calling LLM server")
                 async with session.post(
                     TTSW_AUDIO_INFERENCE_ENDPOINT,
@@ -225,11 +224,11 @@ async def generate_speech(request: Request):
                         if TTSW_AUDIO_INFERENCE_ENDPOINT.startswith("http://")
                         else ssl_context
                     ),
-                    timeout=aiohttp.ClientTimeout(total=60),
+                    timeout=aiohttp.ClientTimeout(total=120),
                 ) as resp:
                     resp.raise_for_status()
                     llm_json = await resp.json()
-                    logger.debug(f"LLM response: {llm_json}")  # Add this
+                    logger.debug(f"LLM response: {llm_json}")
                     if "tokens" not in llm_json:
                         logger.error(f"LLM response missing 'tokens': {llm_json}")
                         raise HTTPException(
@@ -242,7 +241,6 @@ async def generate_speech(request: Request):
                         f"Generated codes: {len(codes)}, codes: {codes[:10]}..."
                     )
 
-                # Batch processing with timing
                 for i in range(0, len(codes), batchSize):
                     batch = codes[i : i + batchSize]
                     logger.debug(
@@ -264,11 +262,38 @@ async def generate_speech(request: Request):
                     ) as resp:
                         resp.raise_for_status()
                         dec_json = await resp.json()
-                        embd = dec_json  # Directly use the list response
-                        if not embd or not isinstance(embd, list):
-                            logger.error(f"Invalid decoder response: {dec_json}")
+                        logger.debug(f"Decoder response: {dec_json}")
+                        if isinstance(dec_json, list):
+                            embd = [
+                                (
+                                    item["embedding"]
+                                    if isinstance(item, dict) and "embedding" in item
+                                    else item
+                                )
+                                for item in dec_json
+                            ]
+                        elif isinstance(dec_json, dict):
+                            embd = dec_json.get("embedding")
+                        else:
+                            logger.error(
+                                f"Unexpected decoder response format: {dec_json}"
+                            )
                             raise HTTPException(
-                                status_code=500, detail="Invalid decoder response"
+                                status_code=500,
+                                detail="Unexpected decoder response format",
+                            )
+                        if (
+                            not embd
+                            or not isinstance(embd, list)
+                            or not all(
+                                isinstance(e, list)
+                                and all(isinstance(v, (int, float)) for v in e)
+                                for e in embd
+                            )
+                        ):
+                            logger.error(f"Invalid embedding format: {embd}")
+                            raise HTTPException(
+                                status_code=500, detail="Invalid embedding format"
                             )
                         audio = embd_to_audio(embd, len(embd), len(embd[0]))
                         audio_data = np.clip(audio * 32767, -32768, 32767).astype(
