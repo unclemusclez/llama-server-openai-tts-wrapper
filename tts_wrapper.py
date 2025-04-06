@@ -14,8 +14,7 @@ from fastapi.responses import Response
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
 
-app = FastAPI()
-# At the top of tts_wrapper.py
+
 import logging
 
 logging.basicConfig(
@@ -65,6 +64,9 @@ seed = int(os.getenv("TTSW_SEED", "69"))
 nFft = int(os.getenv("TTSW_N_FFT", "1280"))
 nHop = int(os.getenv("TTSW_N_HOP", "320"))
 nWin = int(os.getenv("TTSW_N_WIN", "1280"))
+
+app = FastAPI()
+
 
 if not os.path.exists(TTSW_CA_CERT_PATH):
     logger.warning(
