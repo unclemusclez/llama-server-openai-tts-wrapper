@@ -208,6 +208,21 @@ async def generate_speech(request: Request):
 
         all_audio = []
         async with aiohttp.ClientSession() as session:
+            logger.debug("Manual test to inference endpoint")
+            try:
+                async with session.post(
+                    TTSW_AUDIO_INFERENCE_ENDPOINT,
+                    json={
+                        "prompt": "<|im_start|>\n<|text_start|>hi<|audio_start|>\n",
+                        "n_predict": 128,
+                    },
+                    headers={"Authorization": f"Bearer {TTSW_AUDIO_INFERENCE_API_KEY}"},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    test_response = await resp.json()
+                    logger.debug(f"Manual inference response: {test_response}")
+            except Exception as e:
+                logger.error(f"Manual inference test failed: {e}", exc_info=True)
             for segment in segments:
                 prompt_base = (
                     "<|im_start|>\n<|text_start|>"
@@ -287,7 +302,23 @@ async def generate_speech(request: Request):
                                 status_code=500, detail=f"Inference error: {str(e)}"
                             )
                         await asyncio.sleep(5)
-
+                logger.debug(f"Testing decoder endpoint {TTSW_AUDIO_DECODER_ENDPOINT}")
+                try:
+                    async with session.post(
+                        TTSW_AUDIO_DECODER_ENDPOINT,
+                        json={"input": [1, 2, 3]},
+                        headers={
+                            "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
+                        },
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    ) as resp:
+                        test_response = await resp.json()
+                        logger.debug(f"Decoder test response: {test_response}")
+                except Exception as e:
+                    logger.error(f"Decoder test failed: {e}", exc_info=True)
+                logger.debug(
+                    f"Starting decoder loop with codes: {codes[:10]}... (total {len(codes)})"
+                )
                 for i in range(0, len(codes), batchSize):
                     batch = codes[i : i + batchSize]
                     logger.info(
@@ -310,9 +341,7 @@ async def generate_speech(request: Request):
                                     if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
                                     else ssl_context
                                 ),
-                                timeout=aiohttp.ClientTimeout(
-                                    total=60
-                                ),  # Reduced for faster feedback
+                                timeout=aiohttp.ClientTimeout(total=60),
                             ) as resp:
                                 resp.raise_for_status()
                                 dec_json = await resp.json()
