@@ -173,7 +173,7 @@ async def generate_speech(request: Request):
         req = SpeechRequest(**payload)
         text, voice_file, segmentation = req.input, req.voice, req.segmentation
         n_predict = req.n_predict if req.n_predict is not None else nPredict
-        n_predict = min(n_predict, 2048)
+        n_predict = min(n_predict, 4096)  # Keep higher cap
         if not text:
             logger.error("No input provided")
             raise HTTPException(status_code=400, detail="Missing 'input' in payload")
@@ -203,174 +203,208 @@ async def generate_speech(request: Request):
                     status_code=400, detail=f"Voice file '{voice_file}' not found"
                 )
 
-        segments = process_text(text, segmentation)
+        # Use punctuation-based segmentation for chunking
+        segments = process_text(text, segmentation="punctuation")  # Split by .!?
         logger.debug(f"Processed segments: {segments}")
 
         all_audio = []
         async with aiohttp.ClientSession() as session:
-            # Process all text as one prompt
-            prompt = (
-                "<|im_start|>\n<|text_start|>"
-                + "<|text_sep|>".join(segments)  # Use separator like example
-                + "<|text_end|>\n<|audio_start|>\n"
-            )
-            logger.debug(f"Combined prompt: {prompt}")
+            for i, segment in enumerate(segments):
+                # Skip empty segments
+                if not segment:
+                    continue
+                prompt = (
+                    "<|im_start|>\n<|text_start|>"
+                    + "<|text_sep|>".join(segment)
+                    + "<|text_end|>\n<|audio_start|>\n"
+                )
+                logger.debug(f"Processing segment {i+1}/{len(segments)}: {prompt}")
 
-            # Inference
-            logger.debug(
-                f"Sending inference request to {TTSW_AUDIO_INFERENCE_ENDPOINT} with API key: {TTSW_AUDIO_INFERENCE_API_KEY}"
-            )
-            minimal_payload = {
-                "prompt": [prompt],  # Wrap in list like example
-                "n_predict": n_predict,
-                "cache_prompt": True,
-                "return_tokens": True,
-                "samplers": ["top_k"],
-                "top_k": 16,
-                "seed": 1003,
-            }
-            if voice_data:
-                minimal_payload["voice"] = voice_data
-            logger.debug(f"Minimal payload: {minimal_payload}")
-            for attempt in range(3):
-                try:
-                    async with session.post(
-                        TTSW_AUDIO_INFERENCE_ENDPOINT,
-                        json=minimal_payload,
-                        headers={
-                            "Authorization": f"Bearer {TTSW_AUDIO_INFERENCE_API_KEY}"
-                        },
-                        ssl=(
-                            False
-                            if TTSW_AUDIO_INFERENCE_ENDPOINT.startswith("http://")
-                            else ssl_context
-                        ),
-                        timeout=aiohttp.ClientTimeout(total=30),
-                    ) as resp:
-                        resp.raise_for_status()
-                        llm_json = await resp.json()
-                        logger.debug(f"Inference response: {llm_json}")
-                        if "tokens" not in llm_json:
-                            logger.error(f"LLM response missing 'tokens': {llm_json}")
-                            raise HTTPException(
-                                status_code=500,
-                                detail="LLM server did not return tokens",
-                            )
-                        # Log raw tokens for debugging
-                        logger.debug(
-                            f"Raw tokens: {llm_json['tokens'][:20]}... (total {len(llm_json['tokens'])})"
-                        )
-                        codes = [
-                            t - 151672
-                            for t in llm_json["tokens"]
-                            if 151672 <= t <= 155772
-                        ]
-                        if not codes:
-                            logger.warning(
-                                "No valid codes in range 151672-155772. Check token range."
-                            )
-                            all_tokens = llm_json["tokens"]
+                # Inference
+                logger.debug(
+                    f"Sending inference request to {TTSW_AUDIO_INFERENCE_ENDPOINT} with API key: {TTSW_AUDIO_INFERENCE_API_KEY}"
+                )
+                minimal_payload = {
+                    "prompt": [prompt],
+                    "n_predict": n_predict,
+                    "cache_prompt": True,
+                    "return_tokens": True,
+                    "samplers": ["top_k", "temperature", "top_p"],
+                    "top_k": 50,
+                    "temperature": 0.8,
+                    "top_p": 0.95,
+                    "seed": 1003,
+                }
+                if voice_data:
+                    minimal_payload["voice"] = voice_data
+                logger.debug(f"Minimal payload: {minimal_payload}")
+                for attempt in range(3):
+                    try:
+                        async with session.post(
+                            TTSW_AUDIO_INFERENCE_ENDPOINT,
+                            json=minimal_payload,
+                            headers={
+                                "Authorization": f"Bearer {TTSW_AUDIO_INFERENCE_API_KEY}"
+                            },
+                            ssl=(
+                                False
+                                if TTSW_AUDIO_INFERENCE_ENDPOINT.startswith("http://")
+                                else ssl_context
+                            ),
+                            timeout=aiohttp.ClientTimeout(total=30),
+                        ) as resp:
+                            resp.raise_for_status()
+                            llm_json = await resp.json()
+                            logger.debug(f"Inference response: {llm_json}")
+                            if "tokens" not in llm_json:
+                                logger.error(
+                                    f"LLM response missing 'tokens': {llm_json}"
+                                )
+                                raise HTTPException(
+                                    status_code=500,
+                                    detail="LLM server did not return tokens",
+                                )
                             logger.debug(
-                                f"Token stats - min: {min(all_tokens)}, max: {max(all_tokens)}"
+                                f"Raw tokens: {llm_json['tokens'][:20]}... (total {len(llm_json['tokens'])})"
                             )
-                        logger.debug(
-                            f"Generated codes: {codes[:10]}... (total {len(codes)})"
-                        )
-                        break
-                except asyncio.TimeoutError:
-                    logger.warning(f"Inference timeout on attempt {attempt + 1}")
-                    if attempt == 2:
-                        raise HTTPException(
-                            status_code=504,
-                            detail="Inference endpoint timed out after retries",
-                        )
-                    await asyncio.sleep(5)
-                except aiohttp.ClientError as e:
-                    logger.error(f"Inference request failed: {e}", exc_info=True)
-                    if attempt == 2:
-                        raise HTTPException(
-                            status_code=500, detail=f"Inference error: {str(e)}"
-                        )
-                    await asyncio.sleep(5)
+                            codes = [
+                                t - 151672
+                                for t in llm_json["tokens"]
+                                if 151672 <= t <= 155772
+                            ]
+                            if (
+                                not codes or len(codes) < 50
+                            ):  # Lower threshold for shorter segments
+                                logger.warning(
+                                    "Few/no valid codes in range 151672-155772."
+                                )
+                                all_tokens = llm_json["tokens"]
+                                logger.debug(
+                                    f"Token stats - min: {min(all_tokens)}, max: {max(all_tokens)}"
+                                )
+                                if max(all_tokens) < 151672 or min(all_tokens) > 155772:
+                                    codes = [t for t in all_tokens]
+                                    logger.debug(
+                                        "Using all tokens as codes due to range mismatch."
+                                    )
+                            logger.debug(
+                                f"Generated codes: {codes[:10]}... (total {len(codes)})"
+                            )
+                            break
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Inference timeout on attempt {attempt + 1}")
+                        if attempt == 2:
+                            raise HTTPException(
+                                status_code=504,
+                                detail="Inference endpoint timed out after retries",
+                            )
+                        await asyncio.sleep(5)
+                    except aiohttp.ClientError as e:
+                        logger.error(f"Inference request failed: {e}", exc_info=True)
+                        if attempt == 2:
+                            raise HTTPException(
+                                status_code=500, detail=f"Inference error: {str(e)}"
+                            )
+                        await asyncio.sleep(5)
 
-            # Check for empty codes
-            if not codes:
-                raise HTTPException(
-                    status_code=500,
-                    detail="No valid audio codes generated from inference. Check token range or model.",
+                if not codes:
+                    logger.warning(f"No valid codes for segment {i+1}. Skipping.")
+                    continue
+
+                logger.debug(f"Processing all {len(codes)} codes: {codes[:10]}...")
+                for attempt in range(3):
+                    try:
+                        async with session.post(
+                            TTSW_AUDIO_DECODER_ENDPOINT,
+                            json={"input": codes},
+                            headers={
+                                "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
+                            },
+                            ssl=(
+                                False
+                                if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
+                                else ssl_context
+                            ),
+                            timeout=aiohttp.ClientTimeout(total=30),
+                        ) as resp:
+                            resp.raise_for_status()
+                            dec_json = await resp.json()
+                            logger.debug(f"Decoder response: {dec_json}")
+                            break
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Decoder timeout on attempt {attempt + 1}")
+                        if attempt == 2:
+                            raise HTTPException(
+                                status_code=504,
+                                detail="Decoder timed out after retries",
+                            )
+                        await asyncio.sleep(5)
+                    except aiohttp.ClientError as e:
+                        logger.error(f"Decoder request failed: {e}", exc_info=True)
+                        if attempt == 2:
+                            raise HTTPException(
+                                status_code=500, detail=f"Decoder error: {str(e)}"
+                            )
+                        await asyncio.sleep(5)
+
+                if (
+                    isinstance(dec_json, list)
+                    and dec_json
+                    and "embedding" in dec_json[0]
+                ):
+                    embd = dec_json[0]["embedding"]
+                elif isinstance(dec_json, dict) and "embedding" in dec_json:
+                    embd = dec_json["embedding"]
+                else:
+                    logger.error(f"Invalid decoder response: {dec_json}")
+                    raise HTTPException(
+                        status_code=500, detail=f"Invalid decoder response: {dec_json}"
+                    )
+
+                logger.debug(
+                    f"Embeddings extracted: {embd[:10]}... (total {len(embd)})"
                 )
-
-            # Single Decoder Call
-            logger.debug(f"Processing all {len(codes)} codes: {codes[:10]}...")
-            for attempt in range(3):
-                try:
-                    async with session.post(
-                        TTSW_AUDIO_DECODER_ENDPOINT,
-                        json={"input": codes},
-                        headers={
-                            "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
-                        },
-                        ssl=(
-                            False
-                            if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
-                            else ssl_context
-                        ),
-                        timeout=aiohttp.ClientTimeout(total=30),
-                    ) as resp:
-                        resp.raise_for_status()
-                        dec_json = await resp.json()
-                        logger.debug(f"Decoder response: {dec_json}")
-                        break
-                except asyncio.TimeoutError:
-                    logger.warning(f"Decoder timeout on attempt {attempt + 1}")
-                    if attempt == 2:
-                        raise HTTPException(
-                            status_code=504,
-                            detail="Decoder timed out after retries",
-                        )
-                    await asyncio.sleep(5)
-                except aiohttp.ClientError as e:
-                    logger.error(f"Decoder request failed: {e}", exc_info=True)
-                    if attempt == 2:
-                        raise HTTPException(
-                            status_code=500, detail=f"Decoder error: {str(e)}"
-                        )
-                    await asyncio.sleep(5)
-
-            # Process embeddings
-            if isinstance(dec_json, list) and dec_json and "embedding" in dec_json[0]:
-                embd = dec_json[0]["embedding"]
-            elif isinstance(dec_json, dict) and "embedding" in dec_json:
-                embd = dec_json["embedding"]
-            else:
-                logger.error(f"Invalid decoder response: {dec_json}")
-                raise HTTPException(
-                    status_code=500, detail=f"Invalid decoder response: {dec_json}"
+                embd = [[float(x) for x in row if abs(float(x)) < 1e5] for row in embd]
+                if not embd or not all(len(row) == len(embd[0]) for row in embd):
+                    logger.error(f"Invalid embeddings after sanitization: {embd}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Embeddings contain inconsistent or invalid data",
+                    )
+                logger.debug(
+                    f"Sanitized embeddings: {embd[:10]}... (total {len(embd)})"
                 )
+                if (
+                    not embd
+                    or not isinstance(embd, list)
+                    or not all(isinstance(e, list) for e in embd)
+                ):
+                    logger.error(f"Invalid embeddings format: {embd}")
+                    raise HTTPException(
+                        status_code=500, detail="Decoder returned invalid embeddings"
+                    )
 
-            logger.debug(f"Embeddings extracted: {embd[:10]}... (total {len(embd)})")
-            if (
-                not embd
-                or not isinstance(embd, list)
-                or not all(isinstance(e, list) for e in embd)
-            ):
-                logger.error(f"Invalid embeddings format: {embd}")
-                raise HTTPException(
-                    status_code=500, detail="Decoder returned invalid embeddings"
+                logger.debug(
+                    f"Synthesis params - n_fft: {nFft}, n_hop: {nHop}, n_win: {nWin}"
                 )
-
-            audio = embd_to_audio(embd, len(embd), len(embd[0]))
-            logger.debug(f"Audio generated: {len(audio)} samples")
-            fade_samples = 24000 // 4
-            audio[:fade_samples] = audio[:fade_samples] * np.linspace(
-                0, 1, fade_samples
-            )  # Smooth fade-in
-            audio[-fade_samples:] = audio[-fade_samples:] * np.linspace(
-                1, 0, fade_samples
-            )  # Smooth fade-out
-            logger.debug(f"Audio min/max: {np.min(audio)}, {np.max(audio)}")
-            audio_data = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
-            all_audio.append(audio_data)
+                audio = embd_to_audio(embd, len(embd), len(embd[0]))
+                logger.debug(f"Audio generated: {len(audio)} samples")
+                max_abs = np.max(np.abs(audio))
+                if max_abs > 1.0:
+                    audio = audio / max_abs
+                    logger.debug(
+                        f"Normalized audio to avoid clipping. New min/max: {np.min(audio)}, {np.max(audio)}"
+                    )
+                fade_samples = 24000 // 4
+                audio[:fade_samples] = audio[:fade_samples] * np.linspace(
+                    0, 1, fade_samples
+                )
+                audio[-fade_samples:] = audio[-fade_samples:] * np.linspace(
+                    1, 0, fade_samples
+                )
+                logger.debug(f"Audio min/max: {np.min(audio)}, {np.max(audio)}")
+                audio_data = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+                all_audio.append(audio_data)
 
         if not all_audio:
             logger.error("No audio segments generated")
