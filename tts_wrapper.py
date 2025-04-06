@@ -9,14 +9,13 @@ import numpy as np
 import time
 import asyncio
 import json
+
 from pydantic import BaseModel
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import Response
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
 
-
-import logging
 
 # Remove duplicate logging setups and configure once
 logging.basicConfig(
