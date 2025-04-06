@@ -204,58 +204,34 @@ async def generate_speech(request: Request):
                     status_code=400, detail=f"Voice file '{voice_file}' not found"
                 )
 
-        segments = process_text(text, segmentation)
+            segments = process_text(text, segmentation)
+            logger.debug(f"Processed segments: {segments}")
 
-        all_audio = []
-        async with aiohttp.ClientSession() as session:
-            logger.debug("Manual test to inference endpoint")
-            try:
-                async with session.post(
-                    TTSW_AUDIO_INFERENCE_ENDPOINT,
-                    json={
-                        "prompt": "<|im_start|>\n<|text_start|>hi<|audio_start|>\n",
-                        "n_predict": 128,
-                    },
-                    headers={"Authorization": f"Bearer {TTSW_AUDIO_INFERENCE_API_KEY}"},
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    test_response = await resp.json()
-                    logger.debug(f"Manual inference response: {test_response}")
-            except Exception as e:
-                logger.error(f"Manual inference test failed: {e}", exc_info=True)
-            for segment in segments:
-                prompt_base = (
+            all_audio = []
+            async with aiohttp.ClientSession() as session:
+                # Process all text as one prompt (like old code)
+                prompt = (
                     "<|im_start|>\n<|text_start|>"
-                    + " ".join(segment)
+                    + " ".join(segments[0])  # Combine into single string
                     + "<|audio_start|>\n"
                 )
-                prompt = prompt_base
+                logger.debug(f"Combined prompt: {prompt}")
 
-                request_payload = {
+                # Inference
+                logger.debug(
+                    f"Sending inference request to {TTSW_AUDIO_INFERENCE_ENDPOINT} with API key: {TTSW_AUDIO_INFERENCE_API_KEY}"
+                )
+                minimal_payload = {
                     "prompt": prompt,
                     "n_predict": n_predict,
                     "cache_prompt": True,
                     "return_tokens": True,
                     "samplers": ["top_k"],
-                    "top_k": topK,
-                    "temperature": temperature,
-                    "top_p": topP,
-                    "seed": seed,
+                    "top_k": 16,
+                    "seed": 1003,
                 }
                 if voice_data:
-                    request_payload["voice"] = (
-                        voice_data  # Adjust if endpoint expects different key
-                    )
-
-                logger.debug(
-                    f"Sending inference request to {TTSW_AUDIO_INFERENCE_ENDPOINT} with API key: {TTSW_AUDIO_INFERENCE_API_KEY}"
-                )
-                # Use minimal payload for testing
-                minimal_payload = {
-                    "prompt": prompt,
-                    "n_predict": n_predict,
-                    "return_tokens": True,
-                }
+                    minimal_payload["voice"] = voice_data
                 logger.debug(f"Minimal payload: {minimal_payload}")
                 for attempt in range(3):
                     try:
@@ -270,7 +246,7 @@ async def generate_speech(request: Request):
                                 if TTSW_AUDIO_INFERENCE_ENDPOINT.startswith("http://")
                                 else ssl_context
                             ),
-                            timeout=aiohttp.ClientTimeout(total=60),
+                            timeout=aiohttp.ClientTimeout(total=30),
                         ) as resp:
                             resp.raise_for_status()
                             llm_json = await resp.json()
@@ -307,155 +283,102 @@ async def generate_speech(request: Request):
                                 status_code=500, detail=f"Inference error: {str(e)}"
                             )
                         await asyncio.sleep(5)
-                logger.debug(f"Testing decoder endpoint {TTSW_AUDIO_DECODER_ENDPOINT}")
-                try:
-                    async with session.post(
-                        TTSW_AUDIO_DECODER_ENDPOINT,
-                        json={"input": [1, 2, 3]},
-                        headers={
-                            "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
-                        },
-                        timeout=aiohttp.ClientTimeout(total=30),
-                    ) as resp:
-                        test_response = await resp.json()
-                        logger.debug(f"Decoder test response: {test_response}")
-                except Exception as e:
-                    logger.error(f"Decoder test failed: {e}", exc_info=True)
-                logger.debug(
-                    f"Reached decoder loop with codes: {codes[:10]}... (total {len(codes)})"
-                )
-                if not codes:
-                    logger.error("No codes generated from inference")
+
+                # Single Decoder Call
+                logger.debug(f"Processing all {len(codes)} codes: {codes[:10]}...")
+                for attempt in range(3):
+                    try:
+                        async with session.post(
+                            TTSW_AUDIO_DECODER_ENDPOINT,
+                            json={"input": codes},
+                            headers={
+                                "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
+                            },
+                            ssl=(
+                                False
+                                if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
+                                else ssl_context
+                            ),
+                            timeout=aiohttp.ClientTimeout(total=30),
+                        ) as resp:
+                            resp.raise_for_status()
+                            dec_json = await resp.json()
+                            logger.debug(f"Decoder response: {dec_json}")
+                            break
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Decoder timeout on attempt {attempt + 1}")
+                        if attempt == 2:
+                            raise HTTPException(
+                                status_code=504,
+                                detail="Decoder timed out after retries",
+                            )
+                        await asyncio.sleep(5)
+                    except aiohttp.ClientError as e:
+                        logger.error(f"Decoder request failed: {e}", exc_info=True)
+                        if attempt == 2:
+                            raise HTTPException(
+                                status_code=500, detail=f"Decoder error: {str(e)}"
+                            )
+                        await asyncio.sleep(5)
+
+                # Process embeddings
+                if (
+                    isinstance(dec_json, list)
+                    and dec_json
+                    and "embedding" in dec_json[0]
+                ):
+                    embd = dec_json[0]["embedding"]
+                elif isinstance(dec_json, dict) and "embedding" in dec_json:
+                    embd = dec_json["embedding"]
+                else:
+                    logger.error(f"Invalid decoder response: {dec_json}")
                     raise HTTPException(
-                        status_code=500, detail="Inference returned no usable tokens"
+                        status_code=500, detail=f"Invalid decoder response: {dec_json}"
                     )
-                for i in range(0, len(codes), batchSize):
-                    batch = codes[i : i + batchSize]
-                    logger.info(
-                        f"Processing batch {i//batchSize + 1}: {len(batch)} codes"
+
+                logger.debug(
+                    f"Embeddings extracted: {embd[:10]}... (total {len(embd)})"
+                )
+                if (
+                    not embd
+                    or not isinstance(embd, list)
+                    or not all(isinstance(e, list) for e in embd)
+                ):
+                    logger.error(f"Invalid embeddings format: {embd}")
+                    raise HTTPException(
+                        status_code=500, detail="Decoder returned invalid embeddings"
                     )
-                    for attempt in range(3):
-                        try:
-                            start_time = time.time()
-                            logger.debug(
-                                f"Sending decoder request to {TTSW_AUDIO_DECODER_ENDPOINT}: {batch}"
-                            )
-                            async with session.post(
-                                TTSW_AUDIO_DECODER_ENDPOINT,
-                                json={"input": batch},
-                                headers={
-                                    "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
-                                },
-                                ssl=(
-                                    False
-                                    if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
-                                    else ssl_context
-                                ),
-                                timeout=aiohttp.ClientTimeout(total=60),
-                            ) as resp:
-                                resp.raise_for_status()
-                                dec_json = await resp.json()
-                                logger.debug(f"Decoder response: {dec_json}")
-                                logger.info(
-                                    f"Decoder batch {i//batchSize + 1} took {time.time() - start_time:.2f}s"
-                                )
-                                break
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                f"Decoder timeout on attempt {attempt + 1} for batch {i//batchSize + 1}"
-                            )
-                            if attempt == 2:
-                                logger.error(
-                                    f"Decoder failed after 3 attempts for batch {i//batchSize + 1}"
-                                )
-                                raise HTTPException(
-                                    status_code=504,
-                                    detail="Decoder timed out after retries",
-                                )
-                            await asyncio.sleep(5)
-                        except aiohttp.ClientError as e:
-                            logger.error(f"Decoder request failed: {e}", exc_info=True)
-                            if attempt == 2:
-                                raise HTTPException(
-                                    status_code=500, detail=f"Decoder error: {str(e)}"
-                                )
-                            await asyncio.sleep(5)
 
-                        logger.debug(f"Processing decoder response: {dec_json}")
-                        if isinstance(dec_json, list) and dec_json:
-                            if isinstance(dec_json[0], dict) and "codes" in dec_json[0]:
-                                logger.debug("Extracting 'codes' from dictionary")
-                                codes_list = dec_json[0]["codes"]
-                                logger.debug(f"Extracted codes_list: {codes_list}")
-                                embd = [codes_list]
-                                logger.debug(f"Wrapped embd: {embd}")
-                            else:
-                                logger.debug("Treating as raw list of embeddings")
-                                embd = dec_json
-                        elif "embedding" in dec_json:
-                            logger.debug("Found 'embedding' key")
-                            embd = dec_json["embedding"]
-                        elif "embeddings" in dec_json:
-                            logger.debug("Found 'embeddings' key")
-                            embd = dec_json["embeddings"]
-                        else:
-                            logger.error(
-                                f"Decoder response missing expected keys: {dec_json}"
-                            )
-                            raise HTTPException(
-                                status_code=500,
-                                detail="Decoder did not return embeddings in expected format",
-                            )
+                audio = embd_to_audio(embd, len(embd), len(embd[0]))
+                logger.debug(f"Audio generated: {len(audio)} samples")
+                audio[: 24000 // 4] = 0.0  # Fade-in like old code
+                audio_data = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+                all_audio.append(audio_data)
 
-                        logger.debug(f"Extracted embd: {embd}")
-                        if not embd:
-                            logger.error("Embeddings are empty")
-                            raise HTTPException(
-                                status_code=500,
-                                detail="Decoder returned empty embeddings",
-                            )
-                        if not isinstance(embd, list):
-                            logger.error(f"Embeddings are not a list: {type(embd)}")
-                            raise HTTPException(
-                                status_code=500,
-                                detail="Decoder returned invalid embeddings (not a list)",
-                            )
-                        if not all(isinstance(e, list) for e in embd):
-                            logger.error(
-                                f"Embeddings contain non-list elements: {[type(e) for e in embd]}"
-                            )
-                            raise HTTPException(
-                                status_code=500,
-                                detail="Decoder returned invalid embeddings (not a list of lists)",
-                            )
+            if not all_audio:
+                logger.error("No audio segments generated")
+                raise HTTPException(
+                    status_code=500, detail="No audio segments generated"
+                )
 
-                        audio = embd_to_audio(embd, len(embd), len(embd[0]))
-                        audio_data = np.clip(audio * 32767, -32768, 32767).astype(
-                            np.int16
-                        )
-                        all_audio.append(audio_data)
+            combined_audio = np.concatenate(all_audio)
+            logger.debug(f"Combined audio: {len(combined_audio)} samples")
 
-        if not all_audio:
-            logger.error("No audio segments generated")
-            raise HTTPException(status_code=500, detail="No audio segments generated")
+            wav_io = io.BytesIO()
+            with wave.open(wav_io, "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(24000)
+                wav_file.setnframes(len(combined_audio))
+                wav_file.writeframes(combined_audio.tobytes())
 
-        combined_audio = np.concatenate(all_audio)
-
-        wav_io = io.BytesIO()
-        with wave.open(wav_io, "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(24000)
-            wav_file.setnframes(len(combined_audio))
-            wav_file.writeframes(combined_audio.tobytes())
-
-        wav_data = wav_io.getvalue()
-        logger.debug(f"Generated WAV: {len(wav_data)} bytes")
-        return Response(
-            content=wav_data,
-            media_type="audio/wav",
-            headers={"Content-Length": str(len(wav_data))},
-        )
+            wav_data = wav_io.getvalue()
+            logger.debug(f"Generated WAV: {len(wav_data)} bytes")
+            return Response(
+                content=wav_data,
+                media_type="audio/wav",
+                headers={"Content-Length": str(len(wav_data))},
+            )
 
     except aiohttp.ClientError as e:
         logger.error(f"Request failed: {e}", exc_info=True)
