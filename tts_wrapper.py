@@ -343,7 +343,7 @@ async def generate_speech(request: Request):
 
             audio = embd_to_audio(embd, len(embd), len(embd[0]))
             logger.debug(f"Audio generated: {len(audio)} samples")
-            audio[: 24000 // 4] = 0.0  # Fade-in like old code
+            # audio[: 24000 // 4] = 0.0  # Fade-in like old code
             audio_data = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
             all_audio.append(audio_data)
 
