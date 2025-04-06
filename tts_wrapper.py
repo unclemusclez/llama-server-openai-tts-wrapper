@@ -232,8 +232,10 @@ async def generate_speech(request: Request):
                         voice_data  # Adjust if endpoint expects different key
                     )
 
-                logger.debug(f"Sending inference request: {request_payload}")
-                for attempt in range(3):  # Retry logic
+                logger.debug(
+                    f"Sending inference request to {TTSW_AUDIO_INFERENCE_ENDPOINT}: {request_payload}"
+                )
+                for attempt in range(3):
                     try:
                         async with session.post(
                             TTSW_AUDIO_INFERENCE_ENDPOINT,
@@ -247,8 +249,8 @@ async def generate_speech(request: Request):
                                 else ssl_context
                             ),
                             timeout=aiohttp.ClientTimeout(
-                                total=300
-                            ),  # Increase to 300s
+                                total=60
+                            ),  # Reduced for faster feedback
                         ) as resp:
                             resp.raise_for_status()
                             llm_json = await resp.json()
@@ -277,66 +279,68 @@ async def generate_speech(request: Request):
                                 status_code=504,
                                 detail="Inference endpoint timed out after retries",
                             )
-                        await asyncio.sleep(5 * (attempt + 1))
-
-                        for i in range(0, len(codes), batchSize):
-                            batch = codes[i : i + batchSize]
-                            logger.info(
-                                f"Processing batch {i//batchSize + 1}: {len(batch)} codes"
+                        await asyncio.sleep(5)
+                    except aiohttp.ClientError as e:
+                        logger.error(f"Inference request failed: {e}", exc_info=True)
+                        if attempt == 2:
+                            raise HTTPException(
+                                status_code=500, detail=f"Inference error: {str(e)}"
                             )
-                            for attempt in range(3):
-                                try:
-                                    start_time = time.time()
-                                    logger.debug(
-                                        f"Sending decoder request to {TTSW_AUDIO_DECODER_ENDPOINT}: {batch}"
-                                    )
-                                    async with session.post(
-                                        TTSW_AUDIO_DECODER_ENDPOINT,
-                                        json={"input": batch},
-                                        headers={
-                                            "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
-                                        },
-                                        ssl=(
-                                            False
-                                            if TTSW_AUDIO_DECODER_ENDPOINT.startswith(
-                                                "http://"
-                                            )
-                                            else ssl_context
-                                        ),
-                                        timeout=aiohttp.ClientTimeout(
-                                            total=60
-                                        ),  # Reduced to 60s to fail faster for debugging
-                                    ) as resp:
-                                        resp.raise_for_status()
-                                        dec_json = await resp.json()
-                                        logger.debug(f"Decoder response: {dec_json}")
-                                        logger.info(
-                                            f"Decoder batch {i//batchSize + 1} took {time.time() - start_time:.2f}s"
-                                        )
-                                        break
-                                except asyncio.TimeoutError:
-                                    logger.warning(
-                                        f"Decoder timeout on attempt {attempt + 1} for batch {i//batchSize + 1}"
-                                    )
-                                    if attempt == 2:
-                                        logger.error(
-                                            f"Decoder failed after 3 attempts for batch {i//batchSize + 1}"
-                                        )
-                                        raise HTTPException(
-                                            status_code=504,
-                                            detail="Decoder timed out after retries",
-                                        )
-                                    await asyncio.sleep(5)
-                                except aiohttp.ClientError as e:
-                                    logger.error(
-                                        f"Decoder request failed: {e}", exc_info=True
-                                    )
-                                    if attempt == 2:
-                                        raise HTTPException(
-                                            status_code=500,
-                                            detail=f"Decoder error: {str(e)}",
-                                        )
-                                    await asyncio.sleep(5)
+                        await asyncio.sleep(5)
+
+                for i in range(0, len(codes), batchSize):
+                    batch = codes[i : i + batchSize]
+                    logger.info(
+                        f"Processing batch {i//batchSize + 1}: {len(batch)} codes"
+                    )
+                    for attempt in range(3):
+                        try:
+                            start_time = time.time()
+                            logger.debug(
+                                f"Sending decoder request to {TTSW_AUDIO_DECODER_ENDPOINT}: {batch}"
+                            )
+                            async with session.post(
+                                TTSW_AUDIO_DECODER_ENDPOINT,
+                                json={"input": batch},
+                                headers={
+                                    "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
+                                },
+                                ssl=(
+                                    False
+                                    if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
+                                    else ssl_context
+                                ),
+                                timeout=aiohttp.ClientTimeout(
+                                    total=60
+                                ),  # Reduced for faster feedback
+                            ) as resp:
+                                resp.raise_for_status()
+                                dec_json = await resp.json()
+                                logger.debug(f"Decoder response: {dec_json}")
+                                logger.info(
+                                    f"Decoder batch {i//batchSize + 1} took {time.time() - start_time:.2f}s"
+                                )
+                                break
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                f"Decoder timeout on attempt {attempt + 1} for batch {i//batchSize + 1}"
+                            )
+                            if attempt == 2:
+                                logger.error(
+                                    f"Decoder failed after 3 attempts for batch {i//batchSize + 1}"
+                                )
+                                raise HTTPException(
+                                    status_code=504,
+                                    detail="Decoder timed out after retries",
+                                )
+                            await asyncio.sleep(5)
+                        except aiohttp.ClientError as e:
+                            logger.error(f"Decoder request failed: {e}", exc_info=True)
+                            if attempt == 2:
+                                raise HTTPException(
+                                    status_code=500, detail=f"Decoder error: {str(e)}"
+                                )
+                            await asyncio.sleep(5)
 
                         logger.debug(f"Processing decoder response: {dec_json}")
                         if isinstance(dec_json, list) and dec_json:
