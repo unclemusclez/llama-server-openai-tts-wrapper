@@ -17,21 +17,23 @@ from concurrent.futures import ThreadPoolExecutor
 
 import logging
 
+# Remove duplicate logging setups and configure once
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler("tts_wrapper.log", mode="a"),
-        logging.StreamHandler(),  # Add this to see logs in console too
+        logging.StreamHandler(),
     ],
 )
 logger = logging.getLogger(__name__)
-logger.debug("Starting TTS wrapper")
+app = FastAPI()
+logger.debug("TTS wrapper initialized")
 
 # Enable aiohttp logging
 aiohttp_logger = logging.getLogger("aiohttp.client")
 aiohttp_logger.setLevel(logging.DEBUG)
-aiohttp_logger.propagate = True  # Ensure logs go to our handlers
+aiohttp_logger.propagate = True
 
 # Load environment variables
 load_dotenv()
@@ -64,8 +66,6 @@ seed = int(os.getenv("TTSW_SEED", "69"))
 nFft = int(os.getenv("TTSW_N_FFT", "1280"))
 nHop = int(os.getenv("TTSW_N_HOP", "320"))
 nWin = int(os.getenv("TTSW_N_WIN", "1280"))
-
-app = FastAPI()
 
 
 if not os.path.exists(TTSW_CA_CERT_PATH):
@@ -182,6 +182,28 @@ async def generate_speech(request: Request):
         logger.info(
             f"Processing text: {text} with segmentation: {segmentation}, n_predict: {n_predict}"
         )
+
+        # Load voice file if provided
+        voice_data = None
+        if voice_file:
+            voice_path = os.path.join(
+                TTSW_VOICES_DIR,
+                (
+                    f"{voice_file}.json"
+                    if not voice_file.endswith(".json")
+                    else voice_file
+                ),
+            )
+            if os.path.exists(voice_path):
+                with open(voice_path, "r") as f:
+                    voice_data = json.load(f)
+                logger.debug(f"Loaded voice file: {voice_path} with data: {voice_data}")
+            else:
+                logger.warning(f"Voice file not found: {voice_path}")
+                raise HTTPException(
+                    status_code=400, detail=f"Voice file '{voice_file}' not found"
+                )
+
         segments = process_text(text, segmentation)
 
         all_audio = []
@@ -194,19 +216,26 @@ async def generate_speech(request: Request):
                 )
                 prompt = prompt_base
 
+                # Incorporate voice_data into the request if available
+                request_payload = {
+                    "prompt": prompt,
+                    "n_predict": n_predict,
+                    "cache_prompt": True,
+                    "return_tokens": True,
+                    "samplers": ["top_k"],
+                    "top_k": topK,
+                    "temperature": temperature,
+                    "top_p": topP,
+                    "seed": seed,
+                }
+                if voice_data:
+                    request_payload["voice"] = (
+                        voice_data  # Adjust based on API requirements
+                    )
+
                 async with session.post(
                     TTSW_AUDIO_INFERENCE_ENDPOINT,
-                    json={
-                        "prompt": prompt,
-                        "n_predict": n_predict,
-                        "cache_prompt": True,
-                        "return_tokens": True,
-                        "samplers": ["top_k"],
-                        "top_k": topK,
-                        "temperature": temperature,
-                        "top_p": topP,
-                        "seed": seed,
-                    },
+                    json=request_payload,
                     headers={"Authorization": f"Bearer {TTSW_AUDIO_INFERENCE_API_KEY}"},
                     ssl=(
                         False

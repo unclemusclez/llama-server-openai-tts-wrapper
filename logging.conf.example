@@ -1,5 +1,5 @@
 [loggers]
-keys=root,tts_wrapper
+keys=root,aiohttp.client
 
 [handlers]
 keys=console,file
@@ -11,10 +11,10 @@ keys=simple
 level=DEBUG
 handlers=console,file
 
-[logger_tts_wrapper]
+[logger_aiohttp.client]
 level=DEBUG
 handlers=console,file
-qualname=tts_wrapper
+qualname=aiohttp.client
 propagate=0
 
 [handler_console]
