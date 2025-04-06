@@ -256,13 +256,10 @@ async def generate_speech(request: Request):
 
                         # Handle decoder output flexibly
                         if isinstance(dec_json, list):
-                            # If response is a raw list of embeddings
                             embd = dec_json
                         elif "embedding" in dec_json:
-                            # If response has "embedding" key
                             embd = dec_json["embedding"]
                         elif "embeddings" in dec_json:
-                            # Alternative key possibility
                             embd = dec_json["embeddings"]
                         else:
                             logger.error(
@@ -273,16 +270,27 @@ async def generate_speech(request: Request):
                                 detail="Decoder did not return embeddings in expected format",
                             )
 
-                        # Validate embeddings
-                        if (
-                            not embd
-                            or not isinstance(embd, list)
-                            or not all(isinstance(e, list) for e in embd)
-                        ):
-                            logger.error(f"Invalid embeddings format: {embd}")
+                        # Detailed validation logging
+                        logger.debug(f"Extracted embd: {embd}")
+                        if not embd:
+                            logger.error("Embeddings are empty")
                             raise HTTPException(
                                 status_code=500,
-                                detail="Decoder returned invalid embeddings",
+                                detail="Decoder returned empty embeddings",
+                            )
+                        if not isinstance(embd, list):
+                            logger.error(f"Embeddings are not a list: {type(embd)}")
+                            raise HTTPException(
+                                status_code=500,
+                                detail="Decoder returned invalid embeddings (not a list)",
+                            )
+                        if not all(isinstance(e, list) for e in embd):
+                            logger.error(
+                                f"Embeddings contain non-list elements: {[type(e) for e in embd]}"
+                            )
+                            raise HTTPException(
+                                status_code=500,
+                                detail="Decoder returned invalid embeddings (not a list of lists)",
                             )
 
                         # Convert to audio
