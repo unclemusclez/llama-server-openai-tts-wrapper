@@ -254,22 +254,20 @@ async def generate_speech(request: Request):
                                     )
                                 await asyncio.sleep(5 * (attempt + 1))
 
-                        # Handle decoder output
-                        if (
-                            isinstance(dec_json, list)
-                            and dec_json
-                            and isinstance(dec_json[0], dict)
-                            and "codes" in dec_json[0]
-                        ):
-                            # Extract 'codes' from the first dictionary in the list
-                            embd = dec_json[0]["codes"]
-                            # Wrap it in a list to make it a list of lists
-                            embd = [embd]
-                        elif isinstance(dec_json, list):
-                            embd = dec_json
+                        # Handle decoder output with explicit logic
+                        logger.debug(f"Processing decoder response: {dec_json}")
+                        if isinstance(dec_json, list) and dec_json:
+                            if isinstance(dec_json[0], dict) and "codes" in dec_json[0]:
+                                logger.debug("Found 'codes' in dictionary")
+                                embd = [dec_json[0]["codes"]]  # Wrap the codes list
+                            else:
+                                logger.debug("Treating as raw list of embeddings")
+                                embd = dec_json
                         elif "embedding" in dec_json:
+                            logger.debug("Found 'embedding' key")
                             embd = dec_json["embedding"]
                         elif "embeddings" in dec_json:
+                            logger.debug("Found 'embeddings' key")
                             embd = dec_json["embeddings"]
                         else:
                             logger.error(
