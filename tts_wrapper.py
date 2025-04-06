@@ -173,7 +173,7 @@ async def generate_speech(request: Request):
         req = SpeechRequest(**payload)
         text, voice_file, segmentation = req.input, req.voice, req.segmentation
         n_predict = req.n_predict if req.n_predict is not None else nPredict
-        n_predict = min(n_predict, 4096)  # Keep higher cap
+        n_predict = min(n_predict, 4096)
         if not text:
             logger.error("No input provided")
             raise HTTPException(status_code=400, detail="Missing 'input' in payload")
@@ -182,7 +182,6 @@ async def generate_speech(request: Request):
             f"Processing text: {text} with segmentation: {segmentation}, n_predict: {n_predict}"
         )
 
-        # Load voice file if provided
         voice_data = None
         if voice_file:
             voice_path = os.path.join(
@@ -203,14 +202,12 @@ async def generate_speech(request: Request):
                     status_code=400, detail=f"Voice file '{voice_file}' not found"
                 )
 
-        # Use punctuation-based segmentation for chunking
-        segments = process_text(text, segmentation="punctuation")  # Split by .!?
+        segments = process_text(text, segmentation="punctuation")
         logger.debug(f"Processed segments: {segments}")
 
         all_audio = []
         async with aiohttp.ClientSession() as session:
             for i, segment in enumerate(segments):
-                # Skip empty segments
                 if not segment:
                     continue
                 prompt = (
@@ -220,10 +217,6 @@ async def generate_speech(request: Request):
                 )
                 logger.debug(f"Processing segment {i+1}/{len(segments)}: {prompt}")
 
-                # Inference
-                logger.debug(
-                    f"Sending inference request to {TTSW_AUDIO_INFERENCE_ENDPOINT} with API key: {TTSW_AUDIO_INFERENCE_API_KEY}"
-                )
                 minimal_payload = {
                     "prompt": [prompt],
                     "n_predict": n_predict,
@@ -272,9 +265,7 @@ async def generate_speech(request: Request):
                                 for t in llm_json["tokens"]
                                 if 151672 <= t <= 155772
                             ]
-                            if (
-                                not codes or len(codes) < 50
-                            ):  # Lower threshold for shorter segments
+                            if not codes or len(codes) < 50:
                                 logger.warning(
                                     "Few/no valid codes in range 151672-155772."
                                 )
@@ -311,56 +302,74 @@ async def generate_speech(request: Request):
                     logger.warning(f"No valid codes for segment {i+1}. Skipping.")
                     continue
 
-                logger.debug(f"Processing all {len(codes)} codes: {codes[:10]}...")
-                for attempt in range(3):
-                    try:
-                        async with session.post(
-                            TTSW_AUDIO_DECODER_ENDPOINT,
-                            json={"input": codes},
-                            headers={
-                                "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
-                            },
-                            ssl=(
-                                False
-                                if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
-                                else ssl_context
-                            ),
-                            timeout=aiohttp.ClientTimeout(total=30),
-                        ) as resp:
-                            resp.raise_for_status()
-                            dec_json = await resp.json()
-                            logger.debug(f"Decoder response: {dec_json}")
-                            break
-                    except asyncio.TimeoutError:
-                        logger.warning(f"Decoder timeout on attempt {attempt + 1}")
-                        if attempt == 2:
-                            raise HTTPException(
-                                status_code=504,
-                                detail="Decoder timed out after retries",
-                            )
-                        await asyncio.sleep(5)
-                    except aiohttp.ClientError as e:
-                        logger.error(f"Decoder request failed: {e}", exc_info=True)
-                        if attempt == 2:
-                            raise HTTPException(
-                                status_code=500, detail=f"Decoder error: {str(e)}"
-                            )
-                        await asyncio.sleep(5)
-
-                if (
-                    isinstance(dec_json, list)
-                    and dec_json
-                    and "embedding" in dec_json[0]
-                ):
-                    embd = dec_json[0]["embedding"]
-                elif isinstance(dec_json, dict) and "embedding" in dec_json:
-                    embd = dec_json["embedding"]
-                else:
-                    logger.error(f"Invalid decoder response: {dec_json}")
-                    raise HTTPException(
-                        status_code=500, detail=f"Invalid decoder response: {dec_json}"
+                logger.debug(f"Processing {len(codes)} codes in chunks...")
+                chunk_size = 128  # Match physical batch size
+                embeddings = []
+                for chunk_start in range(0, len(codes), chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, len(codes))
+                    code_chunk = codes[chunk_start:chunk_end]
+                    logger.debug(
+                        f"Processing chunk {chunk_start}-{chunk_end} of {len(codes)}: {code_chunk[:10]}..."
                     )
 
+                    for attempt in range(3):
+                        try:
+                            logger.debug(
+                                f"Sending decoder request to {TTSW_AUDIO_DECODER_ENDPOINT}"
+                            )
+                            async with session.post(
+                                TTSW_AUDIO_DECODER_ENDPOINT,
+                                json={"input": code_chunk},
+                                headers={
+                                    "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
+                                },
+                                ssl=(
+                                    False
+                                    if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
+                                    else ssl_context
+                                ),
+                                timeout=aiohttp.ClientTimeout(total=30),
+                            ) as resp:
+                                resp.raise_for_status()
+                                dec_json = await resp.json()
+                                logger.debug(f"Decoder response for chunk: {dec_json}")
+                                if (
+                                    isinstance(dec_json, list)
+                                    and dec_json
+                                    and "embedding" in dec_json[0]
+                                ):
+                                    embeddings.extend(dec_json[0]["embedding"])
+                                elif (
+                                    isinstance(dec_json, dict)
+                                    and "embedding" in dec_json
+                                ):
+                                    embeddings.extend(dec_json["embedding"])
+                                else:
+                                    logger.error(
+                                        f"Invalid decoder response for chunk: {dec_json}"
+                                    )
+                                    raise HTTPException(
+                                        status_code=500,
+                                        detail="Invalid decoder chunk response",
+                                    )
+                                break
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Decoder timeout on attempt {attempt + 1}")
+                            if attempt == 2:
+                                raise HTTPException(
+                                    status_code=504,
+                                    detail="Decoder timed out after retries",
+                                )
+                            await asyncio.sleep(5)
+                        except aiohttp.ClientError as e:
+                            logger.error(f"Decoder request failed: {e}", exc_info=True)
+                            if attempt == 2:
+                                raise HTTPException(
+                                    status_code=500, detail=f"Decoder error: {str(e)}"
+                                )
+                            await asyncio.sleep(5)
+
+                embd = embeddings
                 logger.debug(
                     f"Embeddings extracted: {embd[:10]}... (total {len(embd)})"
                 )
@@ -410,6 +419,7 @@ async def generate_speech(request: Request):
             logger.error("No audio segments generated")
             raise HTTPException(status_code=500, detail="No audio segments generated")
 
+        logger.debug(f"Processed {len(all_audio)} segments out of {len(segments)}")
         combined_audio = np.concatenate(all_audio)
         logger.debug(f"Combined audio: {len(combined_audio)} samples")
 
