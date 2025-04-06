@@ -404,13 +404,13 @@ async def generate_speech(request: Request):
                     logger.debug(
                         f"Normalized audio to avoid clipping. New min/max: {np.min(audio)}, {np.max(audio)}"
                     )
-                fade_samples = 24000 // 4
-                audio[:fade_samples] = audio[:fade_samples] * np.linspace(
-                    0, 1, fade_samples
-                )
-                audio[-fade_samples:] = audio[-fade_samples:] * np.linspace(
-                    1, 0, fade_samples
-                )
+                # fade_samples = 24000 // 4
+                # audio[:fade_samples] = audio[:fade_samples] * np.linspace(
+                #     0, 1, fade_samples
+                # )
+                # audio[-fade_samples:] = audio[-fade_samples:] * np.linspace(
+                #     1, 0, fade_samples
+                # )
                 logger.debug(f"Audio min/max: {np.min(audio)}, {np.max(audio)}")
                 audio_data = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
                 all_audio.append(audio_data)
