@@ -27,6 +27,12 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+logger.debug("Starting TTS wrapper")
+
+# Enable aiohttp logging
+aiohttp_logger = logging.getLogger("aiohttp.client")
+aiohttp_logger.setLevel(logging.DEBUG)
+aiohttp_logger.propagate = True  # Ensure logs go to our handlers
 
 # Load environment variables
 load_dotenv()
