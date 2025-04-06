@@ -1,0 +1,33 @@
+[loggers]
+keys=root,tts_wrapper
+
+[handlers]
+keys=console,file
+
+[formatters]
+keys=simple
+
+[logger_root]
+level=DEBUG
+handlers=console,file
+
+[logger_tts_wrapper]
+level=DEBUG
+handlers=console,file
+qualname=tts_wrapper
+propagate=0
+
+[handler_console]
+class=StreamHandler
+level=DEBUG
+formatter=simple
+args=(sys.stdout,)
+
+[handler_file]
+class=FileHandler
+level=DEBUG
+formatter=simple
+args=('tts_wrapper.log', 'a')
+
+[formatter_simple]
+format=%(asctime)s - %(name)s - %(levelname)s - %(message)s
