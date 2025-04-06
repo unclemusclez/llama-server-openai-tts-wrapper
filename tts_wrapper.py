@@ -166,7 +166,7 @@ async def generate_speech(request: Request):
         req = SpeechRequest(**payload)
         text, voice_file, segmentation = req.input, req.voice, req.segmentation
         n_predict = req.n_predict if req.n_predict is not None else nPredict
-        n_predict = min(n_predict, 2048)  # Cap at 2048
+        n_predict = min(n_predict, 2048)
         if not text:
             logger.error("No input provided")
             raise HTTPException(status_code=400, detail="Missing 'input' in payload")
@@ -186,7 +186,6 @@ async def generate_speech(request: Request):
                 )
                 prompt = prompt_base
 
-                # Inference request
                 async with session.post(
                     TTSW_AUDIO_INFERENCE_ENDPOINT,
                     json={
@@ -222,7 +221,6 @@ async def generate_speech(request: Request):
                         f"Generated codes: {codes[:10]}... (total {len(codes)})"
                     )
 
-                    # Process batches
                     for i in range(0, len(codes), batchSize):
                         batch = codes[i : i + batchSize]
                         logger.info(
@@ -264,12 +262,14 @@ async def generate_speech(request: Request):
                                     )
                                 await asyncio.sleep(5 * (attempt + 1))
 
-                        # Handle decoder output with explicit logic
                         logger.debug(f"Processing decoder response: {dec_json}")
                         if isinstance(dec_json, list) and dec_json:
                             if isinstance(dec_json[0], dict) and "codes" in dec_json[0]:
-                                logger.debug("Found 'codes' in dictionary")
-                                embd = [dec_json[0]["codes"]]  # Wrap the codes list
+                                logger.debug("Extracting 'codes' from dictionary")
+                                codes_list = dec_json[0]["codes"]
+                                logger.debug(f"Extracted codes_list: {codes_list}")
+                                embd = [codes_list]
+                                logger.debug(f"Wrapped embd: {embd}")
                             else:
                                 logger.debug("Treating as raw list of embeddings")
                                 embd = dec_json
@@ -288,7 +288,6 @@ async def generate_speech(request: Request):
                                 detail="Decoder did not return embeddings in expected format",
                             )
 
-                        # Validate embeddings
                         logger.debug(f"Extracted embd: {embd}")
                         if not embd:
                             logger.error("Embeddings are empty")
@@ -311,7 +310,6 @@ async def generate_speech(request: Request):
                                 detail="Decoder returned invalid embeddings (not a list of lists)",
                             )
 
-                        # Convert to audio
                         audio = embd_to_audio(embd, len(embd), len(embd[0]))
                         audio_data = np.clip(audio * 32767, -32768, 32767).astype(
                             np.int16
