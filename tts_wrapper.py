@@ -15,7 +15,17 @@ from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
-logging.basicConfig(level=logging.DEBUG)
+# At the top of tts_wrapper.py
+import logging
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("tts_wrapper.log", mode="a"),
+        logging.StreamHandler(),  # Add this to see logs in console too
+    ],
+)
 logger = logging.getLogger(__name__)
 
 # Load environment variables
