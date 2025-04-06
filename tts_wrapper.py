@@ -147,7 +147,7 @@ def embd_to_audio(embd, n_codes, n_embd, n_thread=4):
 def process_text(text: str, segmentation: str = "none"):
     text = text.lower()
     if segmentation == "punctuation":
-        sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+        sentences = re.split(r"(?<=[.!?,])\s+", text.strip())  # Include commas
         return [re.sub(r"[^a-z\s]", "", s).split() for s in sentences if s]
     elif segmentation == "paragraph":
         paragraphs = text.split("\n")
@@ -201,18 +201,35 @@ async def generate_speech(request: Request):
                 raise HTTPException(
                     status_code=400, detail=f"Voice file '{voice_file}' not found"
                 )
+        if not voice_file:  # Fallback to default voice if provided
+            voice_path = os.path.join(TTSW_VOICES_DIR, "default.json")
+            if os.path.exists(voice_path):
+                with open(voice_path, "r") as f:
+                    voice_data = json.load(f)
+                logger.debug(f"Using default voice file: {voice_path}")
 
-        segments = process_text(text, segmentation="punctuation")
-        logger.debug(f"Processed segments: {segments}")
+        # Use client-provided segmentation
+        segments = process_text(
+            text, segmentation=segmentation or "none"
+        )  # Default to "none" if not provided
+        logger.debug(f"Processed segments: {segments} (total: {len(segments)})")
 
         all_audio = []
         async with aiohttp.ClientSession() as session:
             for i, segment in enumerate(segments):
                 if not segment:
+                    logger.debug(f"Skipping empty segment {i+1}/{len(segments)}")
                     continue
+                # Handle "none" case where segment is a list of words
+                if segmentation == "none":
+                    segment_text = " ".join(segment)  # Join words into a single string
+                else:
+                    segment_text = " ".join(segment)  # Still join for consistency
                 prompt = (
                     "<|im_start|>\n<|text_start|>"
-                    + "<|text_sep|>".join(segment)
+                    + "<|text_sep|>".join(
+                        segment_text.split()
+                    )  # Re-split and join with separators
                     + "<|text_end|>\n<|audio_start|>\n"
                 )
                 logger.debug(f"Processing segment {i+1}/{len(segments)}: {prompt}")
@@ -226,7 +243,7 @@ async def generate_speech(request: Request):
                     "top_k": 50,
                     "temperature": 0.8,
                     "top_p": 0.95,
-                    "seed": 1003,
+                    "seed": 42,  # Fixed seed for voice consistency
                 }
                 if voice_data:
                     minimal_payload["voice"] = voice_data
@@ -267,7 +284,7 @@ async def generate_speech(request: Request):
                             ]
                             if not codes or len(codes) < 50:
                                 logger.warning(
-                                    "Few/no valid codes in range 151672-155772."
+                                    f"Few/no valid codes in range 151672-155772 for segment {i+1}."
                                 )
                                 all_tokens = llm_json["tokens"]
                                 logger.debug(
@@ -299,11 +316,16 @@ async def generate_speech(request: Request):
                         await asyncio.sleep(5)
 
                 if not codes:
-                    logger.warning(f"No valid codes for segment {i+1}. Skipping.")
+                    logger.warning(
+                        f"No valid codes for segment {i+1}/{len(segments)}. Adding silence."
+                    )
+                    all_audio.append(
+                        np.zeros(24000 // 2, dtype=np.int16)
+                    )  # 0.5s silence
                     continue
 
                 logger.debug(f"Processing {len(codes)} codes in chunks...")
-                chunk_size = 128  # Match physical batch size
+                chunk_size = 128
                 embeddings = []
                 for chunk_start in range(0, len(codes), chunk_size):
                     chunk_end = min(chunk_start + chunk_size, len(codes))
@@ -414,6 +436,10 @@ async def generate_speech(request: Request):
                 logger.debug(f"Audio min/max: {np.min(audio)}, {np.max(audio)}")
                 audio_data = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
                 all_audio.append(audio_data)
+                if i < len(segments) - 1:
+                    all_audio.append(
+                        np.zeros(24000 // 8, dtype=np.int16)
+                    )  # 0.125s silence
 
         if not all_audio:
             logger.error("No audio segments generated")
