@@ -174,7 +174,7 @@ async def generate_speech(request: Request):
                     + " ".join(segment)
                     + "<|audio_start|>\n"
                 )
-                prompt = prompt_base  # Simplified, assuming no prior audio_text/audio_data needed
+                prompt = prompt_base
 
                 # Inference request
                 async with session.post(
@@ -208,6 +208,9 @@ async def generate_speech(request: Request):
                     codes = [
                         t - 151672 for t in llm_json["tokens"] if 151672 <= t <= 155772
                     ]
+                    logger.debug(
+                        f"Generated codes: {codes[:10]}... (total {len(codes)})"
+                    )
 
                     # Process batches
                     for i in range(0, len(codes), batchSize):
@@ -235,6 +238,7 @@ async def generate_speech(request: Request):
                                 ) as resp:
                                     resp.raise_for_status()
                                     dec_json = await resp.json()
+                                    logger.debug(f"Decoder response: {dec_json}")
                                     logger.info(
                                         f"Decoder batch {i//batchSize + 1} took {time.time() - start_time:.2f}s"
                                     )
@@ -250,32 +254,50 @@ async def generate_speech(request: Request):
                                     )
                                 await asyncio.sleep(5 * (attempt + 1))
 
-                        # Convert decoder output to audio
-                        # Assuming dec_json contains embeddings; adjust based on actual response
-                        if "embedding" not in dec_json:
+                        # Handle decoder output flexibly
+                        if isinstance(dec_json, list):
+                            # If response is a raw list of embeddings
+                            embd = dec_json
+                        elif "embedding" in dec_json:
+                            # If response has "embedding" key
+                            embd = dec_json["embedding"]
+                        elif "embeddings" in dec_json:
+                            # Alternative key possibility
+                            embd = dec_json["embeddings"]
+                        else:
                             logger.error(
-                                f"Decoder response missing 'embedding': {dec_json}"
+                                f"Decoder response missing expected keys: {dec_json}"
                             )
                             raise HTTPException(
                                 status_code=500,
-                                detail="Decoder did not return embeddings",
+                                detail="Decoder did not return embeddings in expected format",
                             )
-                        embd = dec_json["embedding"]  # Adjust key as per API response
+
+                        # Validate embeddings
+                        if (
+                            not embd
+                            or not isinstance(embd, list)
+                            or not all(isinstance(e, list) for e in embd)
+                        ):
+                            logger.error(f"Invalid embeddings format: {embd}")
+                            raise HTTPException(
+                                status_code=500,
+                                detail="Decoder returned invalid embeddings",
+                            )
+
+                        # Convert to audio
                         audio = embd_to_audio(embd, len(embd), len(embd[0]))
                         audio_data = np.clip(audio * 32767, -32768, 32767).astype(
                             np.int16
                         )
                         all_audio.append(audio_data)
 
-        # Check if audio was generated
         if not all_audio:
             logger.error("No audio segments generated")
             raise HTTPException(status_code=500, detail="No audio segments generated")
 
-        # Combine audio segments
         combined_audio = np.concatenate(all_audio)
 
-        # Write to WAV
         wav_io = io.BytesIO()
         with wave.open(wav_io, "wb") as wav_file:
             wav_file.setnchannels(1)
