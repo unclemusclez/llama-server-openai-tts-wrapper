@@ -216,7 +216,6 @@ async def generate_speech(request: Request):
                 )
                 prompt = prompt_base
 
-                # Incorporate voice_data into the request if available
                 request_payload = {
                     "prompt": prompt,
                     "n_predict": n_predict,
@@ -230,33 +229,55 @@ async def generate_speech(request: Request):
                 }
                 if voice_data:
                     request_payload["voice"] = (
-                        voice_data  # Adjust based on API requirements
+                        voice_data  # Adjust if endpoint expects different key
                     )
 
-                async with session.post(
-                    TTSW_AUDIO_INFERENCE_ENDPOINT,
-                    json=request_payload,
-                    headers={"Authorization": f"Bearer {TTSW_AUDIO_INFERENCE_API_KEY}"},
-                    ssl=(
-                        False
-                        if TTSW_AUDIO_INFERENCE_ENDPOINT.startswith("http://")
-                        else ssl_context
-                    ),
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as resp:
-                    resp.raise_for_status()
-                    llm_json = await resp.json()
-                    if "tokens" not in llm_json:
-                        logger.error(f"LLM response missing 'tokens': {llm_json}")
-                        raise HTTPException(
-                            status_code=500, detail="LLM server did not return tokens"
-                        )
-                    codes = [
-                        t - 151672 for t in llm_json["tokens"] if 151672 <= t <= 155772
-                    ]
-                    logger.debug(
-                        f"Generated codes: {codes[:10]}... (total {len(codes)})"
-                    )
+                logger.debug(f"Sending inference request: {request_payload}")
+                for attempt in range(3):  # Retry logic
+                    try:
+                        async with session.post(
+                            TTSW_AUDIO_INFERENCE_ENDPOINT,
+                            json=request_payload,
+                            headers={
+                                "Authorization": f"Bearer {TTSW_AUDIO_INFERENCE_API_KEY}"
+                            },
+                            ssl=(
+                                False
+                                if TTSW_AUDIO_INFERENCE_ENDPOINT.startswith("http://")
+                                else ssl_context
+                            ),
+                            timeout=aiohttp.ClientTimeout(
+                                total=300
+                            ),  # Increase to 300s
+                        ) as resp:
+                            resp.raise_for_status()
+                            llm_json = await resp.json()
+                            logger.debug(f"Inference response: {llm_json}")
+                            if "tokens" not in llm_json:
+                                logger.error(
+                                    f"LLM response missing 'tokens': {llm_json}"
+                                )
+                                raise HTTPException(
+                                    status_code=500,
+                                    detail="LLM server did not return tokens",
+                                )
+                            codes = [
+                                t - 151672
+                                for t in llm_json["tokens"]
+                                if 151672 <= t <= 155772
+                            ]
+                            logger.debug(
+                                f"Generated codes: {codes[:10]}... (total {len(codes)})"
+                            )
+                            break
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Inference timeout on attempt {attempt + 1}")
+                        if attempt == 2:
+                            raise HTTPException(
+                                status_code=504,
+                                detail="Inference endpoint timed out after retries",
+                            )
+                        await asyncio.sleep(5 * (attempt + 1))
 
                     for i in range(0, len(codes), batchSize):
                         batch = codes[i : i + batchSize]
@@ -266,6 +287,7 @@ async def generate_speech(request: Request):
                         for attempt in range(3):
                             try:
                                 start_time = time.time()
+                                logger.debug(f"Sending decoder request: {batch}")
                                 async with session.post(
                                     TTSW_AUDIO_DECODER_ENDPOINT,
                                     json={"input": batch},
@@ -279,7 +301,9 @@ async def generate_speech(request: Request):
                                         )
                                         else ssl_context
                                     ),
-                                    timeout=aiohttp.ClientTimeout(total=300),
+                                    timeout=aiohttp.ClientTimeout(
+                                        total=600
+                                    ),  # Increase to 600s
                                 ) as resp:
                                     resp.raise_for_status()
                                     dec_json = await resp.json()
@@ -290,7 +314,7 @@ async def generate_speech(request: Request):
                                     break
                             except asyncio.TimeoutError:
                                 logger.warning(
-                                    f"Timeout on attempt {attempt + 1} for batch {i//batchSize + 1}"
+                                    f"Decoder timeout on attempt {attempt + 1} for batch {i//batchSize + 1}"
                                 )
                                 if attempt == 2:
                                     raise HTTPException(
