@@ -16,8 +16,7 @@ from fastapi.responses import Response
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
 
-
-# Remove duplicate logging setups and configure once
+# Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -45,7 +44,8 @@ TTSW_AUDIO_INFERENCE_ENDPOINT = os.getenv(
     "TTSW_AUDIO_INFERENCE_ENDPOINT", "http://127.0.0.1:11434/completion"
 )
 TTSW_AUDIO_DECODER_ENDPOINT = os.getenv(
-    "TTSW_AUDIO_DECODER_ENDPOINT", "http://127.0.0.1:11435/embedding"
+    "TTSW_AUDIO_DECODER_ENDPOINT",
+    "http://127.0.0.1:11435/embeddings",  # Changed to plural
 )
 TTSW_API_KEY = os.getenv("TTSW_API_KEY", None)
 TTSW_AUDIO_DECODER_API_KEY = os.getenv("TTSW_AUDIO_DECODER_API_KEY", TTSW_API_KEY)
@@ -57,8 +57,8 @@ TTSW_DISABLE_VERIFY_SSL = (
 )
 
 # Inference params
-nPredict = int(os.getenv("TTSW_N_PREDICT", "1024"))  # Default, overridden by request
-batchSize = int(os.getenv("TTSW_BATCH_SIZE", "64"))  # Reduced default
+nPredict = int(os.getenv("TTSW_N_PREDICT", "1024"))
+batchSize = int(os.getenv("TTSW_BATCH_SIZE", "64"))
 topK = int(os.getenv("TTSW_TOP_K", "10"))
 temperature = float(os.getenv("TTSW_TEMPERATURE", "0.1"))
 topP = float(os.getenv("TTSW_TOP_P", "0.1"))
@@ -66,7 +66,6 @@ seed = int(os.getenv("TTSW_SEED", "69"))
 nFft = int(os.getenv("TTSW_N_FFT", "1280"))
 nHop = int(os.getenv("TTSW_N_HOP", "320"))
 nWin = int(os.getenv("TTSW_N_WIN", "1280"))
-
 
 if not os.path.exists(TTSW_CA_CERT_PATH):
     logger.warning(
@@ -96,7 +95,7 @@ def fold(buffer, n_out, n_win, n_hop, n_pad):
     for i in range(n_frames):
         start = i * n_hop
         end = start + n_win
-        result[start:end] += buffer[i * n_win : (i + 1) * n_win]  # Fixed
+        result[start:end] += buffer[i * n_win : (i + 1) * n_win]
     return result[n_pad:-n_pad] if n_pad > 0 else result
 
 
@@ -127,7 +126,7 @@ def embd_to_audio(embd, n_codes, n_embd, n_thread=4):
             mag = E[k, l]
             phi = E[k + half_embd, l]
             mag = np.clip(np.exp(mag), 0, 1e2)
-            S[l, k] = mag * np.exp(1j * phi)  # Fixed
+            S[l, k] = mag * np.exp(1j * phi)
 
     res = np.zeros(n_codes * n_fft)
     hann2_buffer = np.zeros(n_codes * n_fft)
@@ -157,7 +156,7 @@ def process_text(text: str, segmentation: str = "none"):
         text = re.sub(r"[-_/,\.\\]", " ", text)
         text = re.sub(r"[^a-z\s]", "", text)
         text = re.sub(r"\s+", " ", text).strip()
-        return [text.split()]
+        return text.split()  # Return flat list, not wrapped in [list]
 
 
 class SpeechRequest(BaseModel):
@@ -209,11 +208,11 @@ async def generate_speech(request: Request):
 
         all_audio = []
         async with aiohttp.ClientSession() as session:
-            # Process all text as one prompt (like old code)
+            # Process all text as one prompt
             prompt = (
                 "<|im_start|>\n<|text_start|>"
-                + " ".join(segments[0])  # Combine into single string
-                + "<|audio_start|>\n"
+                + "<|text_sep|>".join(segments)  # Use separator like example
+                + "<|text_end|>\n<|audio_start|>\n"
             )
             logger.debug(f"Combined prompt: {prompt}")
 
@@ -222,7 +221,7 @@ async def generate_speech(request: Request):
                 f"Sending inference request to {TTSW_AUDIO_INFERENCE_ENDPOINT} with API key: {TTSW_AUDIO_INFERENCE_API_KEY}"
             )
             minimal_payload = {
-                "prompt": prompt,
+                "prompt": [prompt],  # Wrap in list like example
                 "n_predict": n_predict,
                 "cache_prompt": True,
                 "return_tokens": True,
@@ -257,11 +256,23 @@ async def generate_speech(request: Request):
                                 status_code=500,
                                 detail="LLM server did not return tokens",
                             )
+                        # Log raw tokens for debugging
+                        logger.debug(
+                            f"Raw tokens: {llm_json['tokens'][:20]}... (total {len(llm_json['tokens'])})"
+                        )
                         codes = [
                             t - 151672
                             for t in llm_json["tokens"]
                             if 151672 <= t <= 155772
                         ]
+                        if not codes:
+                            logger.warning(
+                                "No valid codes in range 151672-155772. Check token range."
+                            )
+                            all_tokens = llm_json["tokens"]
+                            logger.debug(
+                                f"Token stats - min: {min(all_tokens)}, max: {max(all_tokens)}"
+                            )
                         logger.debug(
                             f"Generated codes: {codes[:10]}... (total {len(codes)})"
                         )
@@ -281,6 +292,13 @@ async def generate_speech(request: Request):
                             status_code=500, detail=f"Inference error: {str(e)}"
                         )
                     await asyncio.sleep(5)
+
+            # Check for empty codes
+            if not codes:
+                raise HTTPException(
+                    status_code=500,
+                    detail="No valid audio codes generated from inference. Check token range or model.",
+                )
 
             # Single Decoder Call
             logger.debug(f"Processing all {len(codes)} codes: {codes[:10]}...")
@@ -343,7 +361,14 @@ async def generate_speech(request: Request):
 
             audio = embd_to_audio(embd, len(embd), len(embd[0]))
             logger.debug(f"Audio generated: {len(audio)} samples")
-            # audio[: 24000 // 4] = 0.0  # Fade-in like old code
+            fade_samples = 24000 // 4
+            audio[:fade_samples] = audio[:fade_samples] * np.linspace(
+                0, 1, fade_samples
+            )  # Smooth fade-in
+            audio[-fade_samples:] = audio[-fade_samples:] * np.linspace(
+                1, 0, fade_samples
+            )  # Smooth fade-out
+            logger.debug(f"Audio min/max: {np.min(audio)}, {np.max(audio)}")
             audio_data = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
             all_audio.append(audio_data)
 
