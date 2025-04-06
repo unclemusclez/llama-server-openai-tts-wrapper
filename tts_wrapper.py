@@ -166,9 +166,6 @@ async def generate_speech(request: Request):
         )
         segments = process_text(text, segmentation)
 
-        # ... (voice file loading)
-        audio_text = ""
-        audio_data = ""
         all_audio = []
         async with aiohttp.ClientSession() as session:
             for segment in segments:
@@ -177,8 +174,9 @@ async def generate_speech(request: Request):
                     + " ".join(segment)
                     + "<|audio_start|>\n"
                 )
-                prompt = audio_text + prompt_base + audio_data
+                prompt = prompt_base  # Simplified, assuming no prior audio_text/audio_data needed
 
+                # Inference request
                 async with session.post(
                     TTSW_AUDIO_INFERENCE_ENDPOINT,
                     json={
@@ -211,6 +209,7 @@ async def generate_speech(request: Request):
                         t - 151672 for t in llm_json["tokens"] if 151672 <= t <= 155772
                     ]
 
+                    # Process batches
                     for i in range(0, len(codes), batchSize):
                         batch = codes[i : i + batchSize]
                         logger.info(
@@ -250,17 +249,32 @@ async def generate_speech(request: Request):
                                         detail="Decoder timed out after retries",
                                     )
                                 await asyncio.sleep(5 * (attempt + 1))
-                audio = embd_to_audio(embd, len(embd), len(embd[0]))
-                audio_data = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
-                all_audio.append(audio_data)
 
-            # Combine all audio segments
-            if not all_audio:
-                logger.error("No audio segments generated")
-                raise HTTPException(
-                    status_code=500, detail="No audio segments generated"
-                )
-            combined_audio = np.concatenate(all_audio)  # Concatenate NumPy arrays
+                        # Convert decoder output to audio
+                        # Assuming dec_json contains embeddings; adjust based on actual response
+                        if "embedding" not in dec_json:
+                            logger.error(
+                                f"Decoder response missing 'embedding': {dec_json}"
+                            )
+                            raise HTTPException(
+                                status_code=500,
+                                detail="Decoder did not return embeddings",
+                            )
+                        embd = dec_json["embedding"]  # Adjust key as per API response
+                        audio = embd_to_audio(embd, len(embd), len(embd[0]))
+                        audio_data = np.clip(audio * 32767, -32768, 32767).astype(
+                            np.int16
+                        )
+                        all_audio.append(audio_data)
+
+        # Check if audio was generated
+        if not all_audio:
+            logger.error("No audio segments generated")
+            raise HTTPException(status_code=500, detail="No audio segments generated")
+
+        # Combine audio segments
+        combined_audio = np.concatenate(all_audio)
+
         # Write to WAV
         wav_io = io.BytesIO()
         with wave.open(wav_io, "wb") as wav_file:
