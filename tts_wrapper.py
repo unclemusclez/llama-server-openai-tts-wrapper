@@ -254,8 +254,18 @@ async def generate_speech(request: Request):
                                     )
                                 await asyncio.sleep(5 * (attempt + 1))
 
-                        # Handle decoder output flexibly
-                        if isinstance(dec_json, list):
+                        # Handle decoder output
+                        if (
+                            isinstance(dec_json, list)
+                            and dec_json
+                            and isinstance(dec_json[0], dict)
+                            and "codes" in dec_json[0]
+                        ):
+                            # Extract 'codes' from the first dictionary in the list
+                            embd = dec_json[0]["codes"]
+                            # Wrap it in a list to make it a list of lists
+                            embd = [embd]
+                        elif isinstance(dec_json, list):
                             embd = dec_json
                         elif "embedding" in dec_json:
                             embd = dec_json["embedding"]
@@ -270,7 +280,7 @@ async def generate_speech(request: Request):
                                 detail="Decoder did not return embeddings in expected format",
                             )
 
-                        # Detailed validation logging
+                        # Validate embeddings
                         logger.debug(f"Extracted embd: {embd}")
                         if not embd:
                             logger.error("Embeddings are empty")
