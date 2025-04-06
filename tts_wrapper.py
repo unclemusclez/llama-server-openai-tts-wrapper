@@ -248,13 +248,20 @@ async def generate_speech(request: Request):
                     )
 
                 logger.debug(
-                    f"Sending inference request to {TTSW_AUDIO_INFERENCE_ENDPOINT}: {request_payload}"
+                    f"Sending inference request to {TTSW_AUDIO_INFERENCE_ENDPOINT} with API key: {TTSW_AUDIO_INFERENCE_API_KEY}"
                 )
+                # Use minimal payload for testing
+                minimal_payload = {
+                    "prompt": prompt,
+                    "n_predict": n_predict,
+                    "return_tokens": True,
+                }
+                logger.debug(f"Minimal payload: {minimal_payload}")
                 for attempt in range(3):
                     try:
                         async with session.post(
                             TTSW_AUDIO_INFERENCE_ENDPOINT,
-                            json=request_payload,
+                            json=minimal_payload,
                             headers={
                                 "Authorization": f"Bearer {TTSW_AUDIO_INFERENCE_API_KEY}"
                             },
@@ -263,9 +270,7 @@ async def generate_speech(request: Request):
                                 if TTSW_AUDIO_INFERENCE_ENDPOINT.startswith("http://")
                                 else ssl_context
                             ),
-                            timeout=aiohttp.ClientTimeout(
-                                total=60
-                            ),  # Reduced for faster feedback
+                            timeout=aiohttp.ClientTimeout(total=60),
                         ) as resp:
                             resp.raise_for_status()
                             llm_json = await resp.json()
@@ -317,8 +322,13 @@ async def generate_speech(request: Request):
                 except Exception as e:
                     logger.error(f"Decoder test failed: {e}", exc_info=True)
                 logger.debug(
-                    f"Starting decoder loop with codes: {codes[:10]}... (total {len(codes)})"
+                    f"Reached decoder loop with codes: {codes[:10]}... (total {len(codes)})"
                 )
+                if not codes:
+                    logger.error("No codes generated from inference")
+                    raise HTTPException(
+                        status_code=500, detail="Inference returned no usable tokens"
+                    )
                 for i in range(0, len(codes), batchSize):
                     batch = codes[i : i + batchSize]
                     logger.info(
