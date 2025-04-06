@@ -4,10 +4,10 @@ import logging
 import os
 import wave
 import io
-import json
 import ssl
 import numpy as np
 import time
+import asyncio
 from pydantic import BaseModel
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import Response
@@ -250,6 +250,17 @@ async def generate_speech(request: Request):
                                         detail="Decoder timed out after retries",
                                     )
                                 await asyncio.sleep(5 * (attempt + 1))
+                audio = embd_to_audio(embd, len(embd), len(embd[0]))
+                audio_data = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+                all_audio.append(audio_data)
+
+            # Combine all audio segments
+            if not all_audio:
+                logger.error("No audio segments generated")
+                raise HTTPException(
+                    status_code=500, detail="No audio segments generated"
+                )
+            combined_audio = np.concatenate(all_audio)  # Concatenate NumPy arrays
         # Write to WAV
         wav_io = io.BytesIO()
         with wave.open(wav_io, "wb") as wav_file:
