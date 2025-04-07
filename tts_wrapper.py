@@ -39,6 +39,12 @@ TTSW_VOICES_DIR = os.getenv("TTSW_VOICES_DIR", "./voices")
 TTSW_DISABLE_VERIFY_SSL = (
     os.getenv("TTSW_DISABLE_VERIFY_SSL", "false").lower() == "true"
 )
+TTSW_VOICES_ENDPOINT = os.getenv(
+    "TTSW_VOICES_ENDPOINT", "/voices"
+)  # Configurable endpoint
+TTSW_SPEECH_ENDPOINT = os.getenv(
+    "TTSW_SPEECH_ENDPOINT", "/speech"
+)  # Configurable endpoint
 
 # Inference params
 nPredict = int(os.getenv("TTSW_N_PREDICT", "256"))
@@ -50,7 +56,7 @@ nFft = int(os.getenv("TTSW_N_FFT", "1280"))
 nHop = int(os.getenv("TTSW_N_HOP", "320"))
 nWin = int(os.getenv("TTSW_N_WIN", "1280"))
 
-# SSL setup (assuming TTSW_CA_CERT_PATH is defined or removed if unused)
+# SSL setup
 ssl_context = None
 if not TTSW_DISABLE_VERIFY_SSL and os.path.exists(
     "/path/to/certs/certfile.crt"
@@ -58,7 +64,7 @@ if not TTSW_DISABLE_VERIFY_SSL and os.path.exists(
     ssl_context = ssl.create_default_context(cafile="/path/to/certs/certfile.crt")
 
 
-# Helper functions (unchanged from previous, assuming they’re in the file)
+# Helper functions (unchanged)
 def fill_hann_window(size, periodic=True):
     if periodic:
         return np.hanning(size + 1)[:-1]
@@ -155,7 +161,37 @@ class SpeechRequest(BaseModel):
     n_predict: int | None = None
 
 
-@app.post("/audio/speech")
+@app.get(TTSW_VOICES_ENDPOINT)
+async def get_available_voices():
+    try:
+        voices_dir = TTSW_VOICES_DIR
+        if not os.path.exists(voices_dir):
+            logger.warning(f"Voices directory not found: {voices_dir}")
+            return {"voices": []}
+
+        available_voices = {}
+        for filename in os.listdir(voices_dir):
+            if filename.endswith(".json"):
+                voice_id = filename[:-5]
+                voice_path = os.path.join(voices_dir, filename)
+                try:
+                    with open(voice_path, "r") as f:
+                        voice_data = json.load(f)
+                        voice_name = voice_data.get("name", voice_id)
+                        available_voices[voice_id] = voice_name
+                except (json.JSONDecodeError, IOError) as e:
+                    logger.error(f"Error reading voice file {voice_path}: {str(e)}")
+                    available_voices[voice_id] = voice_id
+
+        logger.debug(f"Available voices: {available_voices}")
+        return {"voices": [{"id": k, "name": v} for k, v in available_voices.items()]}
+
+    except Exception as e:
+        logger.error(f"Error fetching voices: {str(e)}", exc_info=True)
+        return {"voices": []}
+
+
+@app.post(TTSW_SPEECH_ENDPOINT)
 async def generate_speech(request: Request):
     try:
         payload = await request.json()
@@ -175,10 +211,12 @@ async def generate_speech(request: Request):
             if os.path.exists(voice_path):
                 with open(voice_path, "r") as f:
                     voice_data = json.load(f)
-                    voice_prefix = voice_data.get("text", "")
-                    text = voice_prefix + "\n" + text
+                    # Don’t prepend text; just load codes for potential use
                     for word_data in voice_data.get("words", []):
                         voice_codes[word_data["word"]] = word_data["codes"]
+                    logger.debug(
+                        f"Loaded voice codes for {voice_file}: {list(voice_codes.keys())}"
+                    )
             else:
                 logger.warning(f"Voice file not found: {voice_path}")
 
@@ -197,79 +235,91 @@ async def generate_speech(request: Request):
                 )
                 logger.debug(f"Processing segment {i+1}/{len(segments)}: {prompt}")
 
-                tts_payload = {
-                    "prompt": prompt,
-                    "n_predict": n_predict,
-                    "temperature": temperature,
-                    "top_k": topK,
-                    "top_p": topP,
-                    "seed": seed,
-                    "cache_prompt": True,
-                    "return_tokens": True,
-                    "samplers": ["top_k"],
-                }
-                for attempt in range(3):
-                    try:
-                        async with session.post(
-                            TTSW_AUDIO_INFERENCE_ENDPOINT,
-                            json=tts_payload,
-                            headers={
-                                "Authorization": f"Bearer {TTSW_AUDIO_INFERENCE_API_KEY}"
-                            },
-                            ssl=(
-                                False
-                                if TTSW_AUDIO_INFERENCE_ENDPOINT.startswith("http://")
-                                else ssl_context
-                            ),
-                            timeout=aiohttp.ClientTimeout(total=30),
-                        ) as resp:
-                            resp.raise_for_status()
-                            llm_json = await resp.json()
-                            logger.debug(f"LLM response: {llm_json}")
-                            codes = llm_json.get("tokens", [])
-                            logger.debug(
-                                f"Raw tokens: {codes[:20]}... (total {len(codes)})"
-                            )
-                            if not codes:
-                                logger.warning(
-                                    "No tokens in LLM response, using fallback"
+                # Option 1: Use voice codes directly if words match (simplest approach)
+                if voice_codes and all(word in voice_codes for word in segment):
+                    codes = []
+                    for word in segment:
+                        codes.extend(voice_codes[word])
+                    logger.debug(
+                        f"Using voice file codes for segment {i+1}: {codes[:10]}... (total {len(codes)})"
+                    )
+                else:
+                    # Option 2: Generate codes via LLM (fallback)
+                    tts_payload = {
+                        "prompt": prompt,
+                        "n_predict": n_predict,
+                        "temperature": temperature,
+                        "top_k": topK,
+                        "top_p": topP,
+                        "seed": seed,
+                        "cache_prompt": True,
+                        "return_tokens": True,
+                        "samplers": ["top_k"],
+                    }
+                    for attempt in range(3):
+                        try:
+                            async with session.post(
+                                TTSW_AUDIO_INFERENCE_ENDPOINT,
+                                json=tts_payload,
+                                headers={
+                                    "Authorization": f"Bearer {TTSW_AUDIO_INFERENCE_API_KEY}"
+                                },
+                                ssl=(
+                                    False
+                                    if TTSW_AUDIO_INFERENCE_ENDPOINT.startswith(
+                                        "http://"
+                                    )
+                                    else ssl_context
+                                ),
+                                timeout=aiohttp.ClientTimeout(total=30),
+                            ) as resp:
+                                resp.raise_for_status()
+                                llm_json = await resp.json()
+                                logger.debug(f"LLM response: {llm_json}")
+                                codes = llm_json.get("tokens", [])
+                                logger.debug(
+                                    f"Raw tokens: {codes[:20]}... (total {len(codes)})"
                                 )
-                                codes = [0] * 50
-                            else:
-                                # Uncomment to test hardcoded codes
-                                # codes = [391, 1319, 1478, 895, 1580, 533, 166, 1015, 1169, 1186, 380]  # "so"
-                                all_tokens = codes
-                                codes = [
-                                    t - 151672
-                                    for t in codes
-                                    if t >= 151672 and t <= 155772
-                                ]
-                                if not codes or len(codes) < 50:
+                                if not codes:
                                     logger.warning(
-                                        "Few/no valid codes in range 151672-155772"
+                                        "No tokens in LLM response, using fallback"
                                     )
-                                    logger.debug(
-                                        f"Token stats - min: {min(all_tokens)}, max: {max(all_tokens)}"
-                                    )
-                                    if (
-                                        max(all_tokens) < 151672
-                                        or min(all_tokens) > 155772
-                                    ):
-                                        codes = [t for t in all_tokens]
-                                        logger.debug(
-                                            "Using all tokens due to range mismatch"
+                                    codes = [0] * 50
+                                else:
+                                    all_tokens = codes
+                                    codes = [
+                                        t - 151672
+                                        for t in codes
+                                        if t >= 151672 and t <= 155772
+                                    ]
+                                    if not codes or len(codes) < 50:
+                                        logger.warning(
+                                            "Few/no valid codes in range 151672-155772"
                                         )
-                            logger.debug(
-                                f"Extracted codes: {codes[:10]}... (total {len(codes)})"
+                                        logger.debug(
+                                            f"Token stats - min: {min(all_tokens)}, max: {max(all_tokens)}"
+                                        )
+                                        if (
+                                            max(all_tokens) < 151672
+                                            or min(all_tokens) > 155772
+                                        ):
+                                            codes = [t for t in all_tokens]
+                                            logger.debug(
+                                                "Using all tokens due to range mismatch"
+                                            )
+                                logger.debug(
+                                    f"Extracted codes: {codes[:10]}... (total {len(codes)})"
+                                )
+                                break
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                f"Inference timeout on attempt {attempt + 1}"
                             )
-                            break
-                    except asyncio.TimeoutError:
-                        logger.warning(f"Inference timeout on attempt {attempt + 1}")
-                        if attempt == 2:
-                            raise HTTPException(
-                                status_code=504, detail="Inference timeout"
-                            )
-                        await asyncio.sleep(5)
+                            if attempt == 2:
+                                raise HTTPException(
+                                    status_code=504, detail="Inference timeout"
+                                )
+                            await asyncio.sleep(5)
 
                 chunk_size = 128
                 embeddings = []
