@@ -6,6 +6,7 @@ import os
 import wave
 import io
 import ssl
+import json
 from pydantic import BaseModel
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import Response
