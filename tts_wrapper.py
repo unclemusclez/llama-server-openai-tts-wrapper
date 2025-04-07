@@ -16,6 +16,7 @@ from fastapi.responses import Response
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
 
+
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
@@ -34,8 +35,23 @@ aiohttp_logger = logging.getLogger("aiohttp.client")
 aiohttp_logger.setLevel(logging.DEBUG)
 aiohttp_logger.propagate = True
 
+# Inference params
+nPredict = int(os.getenv("TTSW_N_PREDICT", "1024"))
+batchSize = int(os.getenv("TTSW_BATCH_SIZE", "64"))
+topK = int(os.getenv("TTSW_TOP_K", "50"))
+temperature = float(os.getenv("TTSW_TEMPERATURE", "0.8"))
+topP = float(os.getenv("TTSW_TOP_P", "0.95"))
+seed = int(os.getenv("TTSW_SEED", "42"))
+nFft = int(os.getenv("TTSW_N_FFT", "1280"))
+nHop = int(os.getenv("TTSW_N_HOP", "320"))
+nWin = int(os.getenv("TTSW_N_WIN", "1280"))
 # Load environment variables
-load_dotenv()
+
+# After load_dotenv()
+load_dotenv(override=True)
+logger.debug(
+    f"Loaded env vars - topK: {topK}, temperature: {temperature}, topP: {topP}, seed: {seed}"
+)
 
 # Server config
 TTSW_HOST = os.getenv("TTSW_HOST", "127.0.0.1")
@@ -56,16 +72,6 @@ TTSW_DISABLE_VERIFY_SSL = (
     os.getenv("TTSW_DISABLE_VERIFY_SSL", "false").lower() == "true"
 )
 
-# Inference params
-nPredict = int(os.getenv("TTSW_N_PREDICT", "1024"))
-batchSize = int(os.getenv("TTSW_BATCH_SIZE", "64"))
-topK = int(os.getenv("TTSW_TOP_K", "10"))
-temperature = float(os.getenv("TTSW_TEMPERATURE", "0.1"))
-topP = float(os.getenv("TTSW_TOP_P", "0.1"))
-seed = int(os.getenv("TTSW_SEED", "69"))
-nFft = int(os.getenv("TTSW_N_FFT", "1280"))
-nHop = int(os.getenv("TTSW_N_HOP", "320"))
-nWin = int(os.getenv("TTSW_N_WIN", "1280"))
 
 if not os.path.exists(TTSW_CA_CERT_PATH):
     logger.warning(
@@ -172,17 +178,18 @@ async def generate_speech(request: Request):
         payload = await request.json()
         req = SpeechRequest(**payload)
         text, voice_file, segmentation = req.input, req.voice, req.segmentation
-        n_predict = req.n_predict if req.n_predict is not None else nPredict
-        n_predict = min(n_predict, 4096)
+        n_predict = min(req.n_predict if req.n_predict is not None else nPredict, 4096)
         if not text:
-            logger.error("No input provided")
             raise HTTPException(status_code=400, detail="Missing 'input' in payload")
 
         logger.info(
             f"Processing text: {text} with segmentation: {segmentation}, n_predict: {n_predict}"
         )
 
+        # Load voice data
         voice_data = None
+        default_voice_path = os.path.join(TTSW_VOICES_DIR, "en_female_1.json")
+
         if voice_file:
             voice_path = os.path.join(
                 TTSW_VOICES_DIR,
@@ -195,59 +202,60 @@ async def generate_speech(request: Request):
             if os.path.exists(voice_path):
                 with open(voice_path, "r") as f:
                     voice_data = json.load(f)
-                logger.debug(f"Loaded voice file: {voice_path} with data: {voice_data}")
+                logger.debug(f"Loaded specified voice file: {voice_path}")
             else:
-                logger.warning(f"Voice file not found: {voice_path}")
-                raise HTTPException(
-                    status_code=400, detail=f"Voice file '{voice_file}' not found"
-                )
-        if not voice_file:  # Fallback to default voice if provided
-            voice_path = os.path.join(TTSW_VOICES_DIR, "default.json")
-            if os.path.exists(voice_path):
-                with open(voice_path, "r") as f:
-                    voice_data = json.load(f)
-                logger.debug(f"Using default voice file: {voice_path}")
+                logger.warning(f"Specified voice file not found: {voice_path}")
 
-        # Use client-provided segmentation
-        segments = process_text(
-            text, segmentation=segmentation or "none"
-        )  # Default to "none" if not provided
+        # Default to en_female_1.json if no voice specified or file not found
+        if not voice_data:
+            if os.path.exists(default_voice_path):
+                with open(default_voice_path, "r") as f:
+                    voice_data = json.load(f)
+                logger.debug(f"Using default voice: {default_voice_path}")
+            else:
+                logger.warning(f"Default voice file not found: {default_voice_path}")
+
+        # If still no voice_data, proceed without it but log a warning
+        if not voice_data:
+            logger.warning(
+                "No voice data available; proceeding with default model behavior"
+            )
+
+        segments = process_text(text, segmentation=segmentation or "none")
         logger.debug(f"Processed segments: {segments} (total: {len(segments)})")
 
         all_audio = []
         async with aiohttp.ClientSession() as session:
-            for i, segment in enumerate(segments):
-                if not segment:
-                    logger.debug(f"Skipping empty segment {i+1}/{len(segments)}")
-                    continue
-                # Handle "none" case where segment is a list of words
-                if segmentation == "none":
-                    segment_text = " ".join(segment)  # Join words into a single string
-                else:
-                    segment_text = " ".join(segment)  # Still join for consistency
-                prompt = (
-                    "<|im_start|>\n<|text_start|>"
-                    + "<|text_sep|>".join(
-                        segment_text.split()
-                    )  # Re-split and join with separators
-                    + "<|text_end|>\n<|audio_start|>\n"
-                )
-                logger.debug(f"Processing segment {i+1}/{len(segments)}: {prompt}")
+            if segmentation == "none":
+                segment_text = " ".join(segments)
+                prompts = [
+                    f"<|im_start|>\n<|text_start|>{segment_text}<|text_end|>\n<|audio_start|>\n"
+                ]
+            else:
+                prompts = [
+                    f"<|im_start|>\n<|text_start|>{' '.join(segment)}<|text_end|>\n<|audio_start|>\n"
+                    for segment in segments
+                    if segment
+                ]
 
+            for i, prompt in enumerate(prompts):
+                logger.debug(f"Processing prompt {i+1}/{len(prompts)}: {prompt}")
                 minimal_payload = {
                     "prompt": [prompt],
                     "n_predict": n_predict,
                     "cache_prompt": True,
                     "return_tokens": True,
                     "samplers": ["top_k", "temperature", "top_p"],
-                    "top_k": 50,
-                    "temperature": 0.8,
-                    "top_p": 0.95,
-                    "seed": 42,  # Fixed seed for voice consistency
+                    "top_k": topK,
+                    "temperature": temperature,
+                    "top_p": topP,
+                    "seed": seed,
                 }
                 if voice_data:
                     minimal_payload["voice"] = voice_data
                 logger.debug(f"Minimal payload: {minimal_payload}")
+
+                # Inference request
                 for attempt in range(3):
                     try:
                         async with session.post(
@@ -415,6 +423,7 @@ async def generate_speech(request: Request):
                         status_code=500, detail="Decoder returned invalid embeddings"
                     )
 
+                # Audio synthesis
                 logger.debug(
                     f"Synthesis params - n_fft: {nFft}, n_hop: {nHop}, n_win: {nWin}"
                 )
@@ -426,26 +435,21 @@ async def generate_speech(request: Request):
                     logger.debug(
                         f"Normalized audio to avoid clipping. New min/max: {np.min(audio)}, {np.max(audio)}"
                     )
-                # fade_samples = 24000 // 4
-                # audio[:fade_samples] = audio[:fade_samples] * np.linspace(
-                #     0, 1, fade_samples
-                # )
-                # audio[-fade_samples:] = audio[-fade_samples:] * np.linspace(
-                #     1, 0, fade_samples
-                # )
                 logger.debug(f"Audio min/max: {np.min(audio)}, {np.max(audio)}")
                 audio_data = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
                 all_audio.append(audio_data)
-                if i < len(segments) - 1:
+                if i < len(prompts) - 1:  # Adjusted to use prompts length
                     all_audio.append(
-                        np.zeros(24000 // 8, dtype=np.int16)
+                        np.zeros(24000 // 4, dtype=np.int16)
                     )  # 0.125s silence
 
         if not all_audio:
             logger.error("No audio segments generated")
             raise HTTPException(status_code=500, detail="No audio segments generated")
 
-        logger.debug(f"Processed {len(all_audio)} segments out of {len(segments)}")
+        logger.debug(
+            f"Processed {len(all_audio)} segments out of {len(prompts)} prompts"
+        )
         combined_audio = np.concatenate(all_audio)
         logger.debug(f"Combined audio: {len(combined_audio)} samples")
 
