@@ -159,6 +159,39 @@ class SpeechRequest(BaseModel):
     n_predict: int | None = None
 
 
+@app.get("/audio/voices")
+async def get_available_voices():
+    """Return a dictionary of available voices from the voices directory."""
+    try:
+        voices_dir = TTSW_VOICES_DIR
+        if not os.path.exists(voices_dir):
+            logger.warning(f"Voices directory not found: {voices_dir}")
+            return {}
+
+        available_voices = {}
+        for filename in os.listdir(voices_dir):
+            if filename.endswith(".json"):
+                voice_id = filename[:-5]  # Remove '.json' extension
+                voice_path = os.path.join(voices_dir, filename)
+                try:
+                    with open(voice_path, "r") as f:
+                        voice_data = json.load(f)
+                        # Use 'name' field if present, otherwise fallback to filename
+                        voice_name = voice_data.get("name", voice_id)
+                        available_voices[voice_id] = voice_name
+                except (json.JSONDecodeError, IOError) as e:
+                    logger.error(f"Error reading voice file {voice_path}: {str(e)}")
+                    # Fallback to filename if JSON is invalid or unreadable
+                    available_voices[voice_id] = voice_id
+
+        logger.debug(f"Available voices: {available_voices}")
+        return {"voices": [{"id": k, "name": v} for k, v in available_voices.items()]}
+
+    except Exception as e:
+        logger.error(f"Error fetching voices: {str(e)}", exc_info=True)
+        return {}
+
+
 @app.post("/audio/speech")
 async def generate_speech(request: Request):
     try:
