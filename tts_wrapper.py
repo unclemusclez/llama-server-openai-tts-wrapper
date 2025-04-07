@@ -144,12 +144,15 @@ def embd_to_audio(embd, n_codes, n_embd, n_thread=4):
 
 
 def process_text(text: str):
-    # Always process as a single string, no splitting
     text = text.lower()
     text = re.sub(r"[-_/,\.\\]", " ", text)
     text = re.sub(r"[^a-z\s]", "", text)
     text = re.sub(r"\s+", " ", text).strip()
-    return text
+    words = text.split()
+    formatted_text = (
+        "<|im_start|>\n<|text_start|>" + "<|text_sep|>".join(words) + "<|text_end|>\n"
+    )
+    return formatted_text
 
 
 class SpeechRequest(BaseModel):
@@ -202,17 +205,29 @@ async def generate_speech(request: Request):
         if not text:
             raise HTTPException(status_code=400, detail="Missing 'input' in payload")
 
+        # Load voice profile if provided
+        if voice_file:
+            voice_path = os.path.join(TTSW_VOICES_DIR, f"{voice_file}.json")
+            if os.path.exists(voice_path):
+                with open(voice_path, "r") as f:
+                    voice_data = json.load(f)
+                    voice_prefix = voice_data.get("text", "")
+                    text = voice_prefix + "\n" + text
+
         logger.info(f"Processing text: {text}, n_predict: {n_predict}")
+        processed_text = process_text(text)
 
         async with aiohttp.ClientSession() as session:
             # TTS request to LLM
             tts_payload = {
-                "prompt": text,
+                "prompt": processed_text,
                 "n_predict": n_predict,
                 "temperature": temperature,
                 "top_k": topK,
                 "top_p": topP,
                 "seed": seed,
+                "return_tokens": True,
+                "samplers": ["top_k"],
             }
             async with session.post(
                 TTSW_AUDIO_INFERENCE_ENDPOINT,
@@ -230,7 +245,12 @@ async def generate_speech(request: Request):
                 codes = llm_json.get("tokens", [])
                 if not codes:
                     logger.warning("No tokens in LLM response, using fallback")
-                    codes = [0] * 50  # Fallback; adjust length if needed
+                    codes = [0] * 50
+                else:
+                    codes = [t - 151672 for t in codes if t >= 151672 and t <= 155772]
+                    if not codes:
+                        logger.warning("Filtered codes empty, using fallback")
+                        codes = [0] * 50
                 logger.debug(f"Extracted codes: {codes[:10]}... (total {len(codes)})")
 
             # Decoder request
@@ -283,10 +303,6 @@ async def generate_speech(request: Request):
             media_type="audio/wav",
             headers={"Content-Length": str(len(wav_data))},
         )
-
-    except Exception as e:
-        logger.error(f"Processing failed: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal TTS error: {str(e)}")
 
     except Exception as e:
         logger.error(f"Processing failed: {str(e)}", exc_info=True)
