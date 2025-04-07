@@ -204,214 +204,103 @@ async def generate_speech(request: Request):
 
         logger.info(f"Processing text: {text}, n_predict: {n_predict}")
 
-        # Load voice data
-        voice_data = None
-        default_voice_path = os.path.join(TTSW_VOICES_DIR, "en_female_1.json")
-
-        if voice_file:
-            voice_path = os.path.join(
-                TTSW_VOICES_DIR,
-                (
-                    f"{voice_file}.json"
-                    if not voice_file.endswith(".json")
-                    else voice_file
-                ),
-            )
-            if os.path.exists(voice_path):
-                with open(voice_path, "r") as f:
-                    voice_data = json.load(f)
-                logger.debug(f"Loaded specified voice file: {voice_path}")
-            else:
-                logger.warning(f"Specified voice file not found: {voice_path}")
-
-        if not voice_data:
-            if os.path.exists(default_voice_path):
-                with open(default_voice_path, "r") as f:
-                    voice_data = json.load(f)
-                logger.debug(f"Using default voice: {default_voice_path}")
-            else:
-                logger.warning(f"Default voice file not found: {default_voice_path}")
-
-        if not voice_data:
-            logger.warning(
-                "No voice data available; proceeding with default model behavior"
-            )
-
-        # Process text as a single string
-        processed_text = process_text(text)
-        logger.debug(f"Processed text: {processed_text}")
-
-        all_audio = []
         async with aiohttp.ClientSession() as session:
-            prompt = f"<|im_start|>\n<|text_start|>{processed_text}<|text_end|>\n<|audio_start|>\n"
-            logger.debug(f"Processing prompt: {prompt}")
-            minimal_payload = {
-                "prompt": [prompt],
+            # Step 1: Send text to LLM server for spectrogram codes
+            tts_payload = {
+                "prompt": text,  # Raw text, no tags
                 "n_predict": n_predict,
-                "cache_prompt": True,
-                "return_tokens": True,
-                "samplers": ["top_k", "temperature", "top_p"],
-                "top_k": topK,
                 "temperature": temperature,
+                "top_k": topK,
                 "top_p": topP,
                 "seed": seed,
             }
-            if voice_data:
-                minimal_payload["voice"] = voice_data
-            logger.debug(f"Minimal payload: {minimal_payload}")
+            logger.debug(f"TTS payload: {tts_payload}")
+            async with session.post(
+                TTSW_AUDIO_INFERENCE_ENDPOINT,  # http://127.0.0.1:11434/completion
+                json=tts_payload,
+                headers={"Authorization": f"Bearer {TTSW_AUDIO_INFERENCE_API_KEY}"},
+                ssl=(
+                    False
+                    if TTSW_AUDIO_INFERENCE_ENDPOINT.startswith("http://")
+                    else ssl_context
+                ),
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                resp.raise_for_status()
+                llm_json = await resp.json()
+                logger.debug(f"LLM response: {llm_json}")
+                # Extract spectrogram codes (assuming 'content' or 'tokens')
+                codes = llm_json.get(
+                    "tokens", []
+                )  # Adjust based on actual response format
+                if not codes:
+                    logger.warning("No codes returned from LLM")
+                    codes = [0] * 50  # Fallback silence
 
-            # Inference request
-            for attempt in range(3):
-                try:
-                    async with session.post(
-                        TTSW_AUDIO_INFERENCE_ENDPOINT,
-                        json=minimal_payload,
-                        headers={
-                            "Authorization": f"Bearer {TTSW_AUDIO_INFERENCE_API_KEY}"
-                        },
-                        ssl=(
-                            False
-                            if TTSW_AUDIO_INFERENCE_ENDPOINT.startswith("http://")
-                            else ssl_context
-                        ),
-                        timeout=aiohttp.ClientTimeout(total=30),
-                    ) as resp:
-                        resp.raise_for_status()
-                        llm_json = await resp.json()
-                        logger.debug(f"Inference response: {llm_json}")
-                        if "tokens" not in llm_json:
-                            logger.error(f"LLM response missing 'tokens': {llm_json}")
-                            raise HTTPException(
-                                status_code=500,
-                                detail="LLM server did not return tokens",
-                            )
-                        codes = [
-                            t - 151672
-                            for t in llm_json["tokens"]
-                            if 151672 <= t <= 155772
-                        ]
-                        if not codes or len(codes) < 50:
-                            logger.warning(
-                                f"Few/no valid codes in range 151672-155772."
-                            )
-                            all_tokens = llm_json["tokens"]
-                            if max(all_tokens) < 151672 or min(all_tokens) > 155772:
-                                codes = [t for t in all_tokens]
-                        logger.debug(
-                            f"Generated codes: {codes[:10]}... (total {len(codes)})"
-                        )
-                        break
-                except asyncio.TimeoutError:
-                    logger.warning(f"Inference timeout on attempt {attempt + 1}")
-                    if attempt == 2:
-                        raise HTTPException(
-                            status_code=504,
-                            detail="Inference endpoint timed out after retries",
-                        )
-                    await asyncio.sleep(5)
-                except aiohttp.ClientError as e:
-                    logger.error(f"Inference request failed: {e}", exc_info=True)
-                    if attempt == 2:
-                        raise HTTPException(
-                            status_code=500, detail=f"Inference error: {str(e)}"
-                        )
-                    await asyncio.sleep(5)
-
-            if not codes:
-                logger.warning("No valid codes generated. Adding silence.")
-                all_audio.append(np.zeros(24000 // 2, dtype=np.int16))
-            else:
-                chunk_size = batchSize
+            # Step 2: Send codes to decoder for embeddings
+            decoder_payload = {"input": codes}
+            logger.debug(f"Decoder payload: {decoder_payload}")
+            async with session.post(
+                TTSW_AUDIO_DECODER_ENDPOINT,  # http://127.0.0.1:11435/embeddings
+                json=decoder_payload,
+                headers={"Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"},
+                ssl=(
+                    False
+                    if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
+                    else ssl_context
+                ),
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                resp.raise_for_status()
+                dec_json = await resp.json()
                 embeddings = []
-                for chunk_start in range(0, len(codes), chunk_size):
-                    chunk_end = min(chunk_start + chunk_size, len(codes))
-                    code_chunk = codes[chunk_start:chunk_end]
-                    decoder_payload = {"input": code_chunk}
-                    if voice_data:
-                        decoder_payload["voice"] = voice_data
-                    logger.debug(f"Decoder payload: {decoder_payload}")
+                if (
+                    isinstance(dec_json, list)
+                    and dec_json
+                    and "embedding" in dec_json[0]
+                ):
+                    embeddings = dec_json[0]["embedding"]
+                elif isinstance(dec_json, dict) and "embedding" in dec_json:
+                    embeddings = dec_json["embedding"]
+                else:
+                    raise HTTPException(
+                        status_code=500, detail=f"Invalid decoder response: {dec_json}"
+                    )
 
-                    for attempt in range(3):
-                        try:
-                            async with session.post(
-                                TTSW_AUDIO_DECODER_ENDPOINT,
-                                json=decoder_payload,
-                                headers={
-                                    "Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"
-                                },
-                                ssl=(
-                                    False
-                                    if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
-                                    else ssl_context
-                                ),
-                                timeout=aiohttp.ClientTimeout(total=30),
-                            ) as resp:
-                                resp.raise_for_status()
-                                dec_json = await resp.json()
-                                if (
-                                    isinstance(dec_json, list)
-                                    and dec_json
-                                    and "embedding" in dec_json[0]
-                                ):
-                                    embeddings.extend(dec_json[0]["embedding"])
-                                elif (
-                                    isinstance(dec_json, dict)
-                                    and "embedding" in dec_json
-                                ):
-                                    embeddings.extend(dec_json["embedding"])
-                                else:
-                                    logger.error(
-                                        f"Invalid decoder response: {dec_json}"
-                                    )
-                                    raise HTTPException(
-                                        status_code=500,
-                                        detail="Invalid decoder response",
-                                    )
-                                break
-                        except asyncio.TimeoutError:
-                            logger.warning(f"Decoder timeout on attempt {attempt + 1}")
-                            if attempt == 2:
-                                raise HTTPException(
-                                    status_code=504,
-                                    detail="Decoder timed out after retries",
-                                )
-                            await asyncio.sleep(5)
-                        except aiohttp.ClientError as e:
-                            logger.error(f"Decoder request failed: {e}", exc_info=True)
-                            if attempt == 2:
-                                raise HTTPException(
-                                    status_code=500, detail=f"Decoder error: {str(e)}"
-                                )
-                            await asyncio.sleep(5)
-
-                embd = embeddings
-                audio = embd_to_audio(embd, len(embd), len(embd[0]))
-                max_abs = np.max(np.abs(audio))
+            # Step 3: Convert embeddings to audio
+            if not embeddings:
+                logger.warning("No embeddings returned; generating silence")
+                audio_data = np.zeros(24000, dtype=np.int16)
+            else:
+                logger.debug(
+                    f"Embeddings: {len(embeddings)} codes, sample: {embeddings[:5]}"
+                )
+                audio = embd_to_audio(embeddings, len(embeddings), len(embeddings[0]))
+                max_abs = max(np.max(np.abs(audio)), 0.01)
                 if max_abs > 1.0:
                     audio = audio / max_abs
                 audio_data = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
-                all_audio.append(audio_data)
 
-        combined_audio = np.concatenate(all_audio)
+        # Generate WAV
         wav_io = io.BytesIO()
         with wave.open(wav_io, "wb") as wav_file:
             wav_file.setnchannels(1)
             wav_file.setsampwidth(2)
             wav_file.setframerate(24000)
-            wav_file.setnframes(len(combined_audio))
-            wav_file.writeframes(combined_audio.tobytes())
+            wav_file.setnframes(len(audio_data))
+            wav_file.writeframes(audio_data.tobytes())
 
         wav_data = wav_io.getvalue()
         logger.debug(f"Generated WAV: {len(wav_data)} bytes")
+        with open("output.wav", "wb") as f:
+            f.write(wav_data)
+
         return Response(
             content=wav_data,
             media_type="audio/wav",
             headers={"Content-Length": str(len(wav_data))},
         )
 
-    except aiohttp.ClientError as e:
-        logger.error(f"Request failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"TTS server error: {str(e)}")
     except Exception as e:
         logger.error(f"Processing failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal TTS error: {str(e)}")
