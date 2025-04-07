@@ -205,18 +205,17 @@ async def generate_speech(request: Request):
         logger.info(f"Processing text: {text}, n_predict: {n_predict}")
 
         async with aiohttp.ClientSession() as session:
-            # Step 1: Send text to LLM server for spectrogram codes
+            # TTS request to LLM
             tts_payload = {
-                "prompt": text,  # Raw text, no tags
+                "prompt": text,
                 "n_predict": n_predict,
                 "temperature": temperature,
                 "top_k": topK,
                 "top_p": topP,
                 "seed": seed,
             }
-            logger.debug(f"TTS payload: {tts_payload}")
             async with session.post(
-                TTSW_AUDIO_INFERENCE_ENDPOINT,  # http://127.0.0.1:11434/completion
+                TTSW_AUDIO_INFERENCE_ENDPOINT,
                 json=tts_payload,
                 headers={"Authorization": f"Bearer {TTSW_AUDIO_INFERENCE_API_KEY}"},
                 ssl=(
@@ -224,24 +223,20 @@ async def generate_speech(request: Request):
                     if TTSW_AUDIO_INFERENCE_ENDPOINT.startswith("http://")
                     else ssl_context
                 ),
-                timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 resp.raise_for_status()
                 llm_json = await resp.json()
                 logger.debug(f"LLM response: {llm_json}")
-                # Extract spectrogram codes (assuming 'content' or 'tokens')
-                codes = llm_json.get(
-                    "tokens", []
-                )  # Adjust based on actual response format
+                codes = llm_json.get("tokens", [])
                 if not codes:
-                    logger.warning("No codes returned from LLM")
-                    codes = [0] * 50  # Fallback silence
+                    logger.warning("No tokens in LLM response, using fallback")
+                    codes = [0] * 50  # Fallback; adjust length if needed
+                logger.debug(f"Extracted codes: {codes[:10]}... (total {len(codes)})")
 
-            # Step 2: Send codes to decoder for embeddings
+            # Decoder request
             decoder_payload = {"input": codes}
-            logger.debug(f"Decoder payload: {decoder_payload}")
             async with session.post(
-                TTSW_AUDIO_DECODER_ENDPOINT,  # http://127.0.0.1:11435/embeddings
+                TTSW_AUDIO_DECODER_ENDPOINT,
                 json=decoder_payload,
                 headers={"Authorization": f"Bearer {TTSW_AUDIO_DECODER_API_KEY}"},
                 ssl=(
@@ -249,37 +244,25 @@ async def generate_speech(request: Request):
                     if TTSW_AUDIO_DECODER_ENDPOINT.startswith("http://")
                     else ssl_context
                 ),
-                timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 resp.raise_for_status()
                 dec_json = await resp.json()
-                embeddings = []
-                if (
-                    isinstance(dec_json, list)
-                    and dec_json
-                    and "embedding" in dec_json[0]
-                ):
-                    embeddings = dec_json[0]["embedding"]
-                elif isinstance(dec_json, dict) and "embedding" in dec_json:
-                    embeddings = dec_json["embedding"]
-                else:
+                embeddings = (
+                    dec_json.get("embedding", []) if isinstance(dec_json, dict) else []
+                )
+                if not embeddings and isinstance(dec_json, list) and dec_json:
+                    embeddings = dec_json[0].get("embedding", [])
+                if not embeddings:
                     raise HTTPException(
-                        status_code=500, detail=f"Invalid decoder response: {dec_json}"
+                        status_code=500, detail="No embeddings from decoder"
                     )
 
-            # Step 3: Convert embeddings to audio
-            if not embeddings:
-                logger.warning("No embeddings returned; generating silence")
-                audio_data = np.zeros(24000, dtype=np.int16)
-            else:
-                logger.debug(
-                    f"Embeddings: {len(embeddings)} codes, sample: {embeddings[:5]}"
-                )
-                audio = embd_to_audio(embeddings, len(embeddings), len(embeddings[0]))
-                max_abs = max(np.max(np.abs(audio)), 0.01)
-                if max_abs > 1.0:
-                    audio = audio / max_abs
-                audio_data = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+            # Audio conversion
+            audio = embd_to_audio(embeddings, len(embeddings), len(embeddings[0]))
+            max_abs = max(np.max(np.abs(audio)), 0.01)
+            if max_abs > 1.0:
+                audio = audio / max_abs
+            audio_data = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
 
         # Generate WAV
         wav_io = io.BytesIO()
@@ -300,6 +283,10 @@ async def generate_speech(request: Request):
             media_type="audio/wav",
             headers={"Content-Length": str(len(wav_data))},
         )
+
+    except Exception as e:
+        logger.error(f"Processing failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal TTS error: {str(e)}")
 
     except Exception as e:
         logger.error(f"Processing failed: {str(e)}", exc_info=True)
